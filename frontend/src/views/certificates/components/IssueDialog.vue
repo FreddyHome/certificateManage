@@ -1,0 +1,124 @@
+<script setup lang="ts">
+import { issueCertificate } from '../../../services/certificates';
+import { reactive, ref, watch } from 'vue';
+import { request } from '../../../api/client';
+import { run } from '../../../composables/useAsyncAction';
+import { ElMessage } from 'element-plus';
+const model = defineModel<boolean>();
+const props = defineProps<{ kind: string }>();
+const emit = defineEmits(['saved']);
+const issuers = ref<any[]>([]),
+  busy = ref(false);
+const form = reactive({
+  country: '',
+  state: '',
+  locality: '',
+  organization: '',
+  organizationalUnit: '',
+  cn: '',
+  purpose: 'GENERAL',
+  days: 365,
+  issuerId: undefined as number | undefined,
+  sans: '',
+});
+const labels: Record<string, string> = {
+  ROOT: '根证书',
+  INTERMEDIATE: '中间证书',
+  LEAF: '叶子证书',
+};
+watch(model, (v) => {
+  if (v) {
+    form.cn = '';
+    form.country = '';
+    form.state = '';
+    form.locality = '';
+    form.organization = '';
+    form.organizationalUnit = '';
+    form.sans = '';
+    form.purpose = 'GENERAL';
+    form.issuerId = undefined;
+    form.days = props.kind === 'ROOT' ? 3650 : props.kind === 'INTERMEDIATE' ? 1825 : 365;
+    run(async () => {
+      issuers.value =
+        props.kind === 'ROOT' ? [] : await request('/issuers?childKind=' + props.kind);
+    });
+  }
+});
+function save() {
+  run(async () => {
+    busy.value = true;
+    try {
+      await issueCertificate({
+        ...form,
+        kind: props.kind,
+        sans: form.sans.split(/[,，\s]+/).filter(Boolean),
+      });
+      ElMessage.success('证书已生成');
+      model.value = false;
+      emit('saved');
+    } finally {
+      busy.value = false;
+    }
+  });
+}
+</script>
+<template>
+  <el-dialog v-model="model" :title="'创建' + labels[kind]" width="620px"
+    ><el-alert
+      :title="kind === 'ROOT' ? '根证书使用新生成私钥自签名' : '请选择有效且保存有私钥的上级证书'"
+      :closable="false"
+    /><el-form label-position="top" style="margin-top: 20px"
+      ><el-form-item
+        v-if="kind !== 'ROOT'"
+        :label="kind === 'LEAF' ? '中间证书' : '根证书'"
+        required
+        ><el-select v-model="form.issuerId" placeholder="选择签发者"
+          ><el-option v-for="i in issuers" :key="i.id" :label="i.name" :value="i.id" /></el-select
+        ><span v-if="!issuers.length" class="sub"
+          >暂无可用上级，请先创建上一层证书</span
+        ></el-form-item
+      ><el-form-item label="主体 Common Name（CN）" required
+        ><el-input v-model="form.cn" maxlength="200"
+      /></el-form-item>
+      <div class="form-grid">
+        <el-form-item label="国家 / 地区（C）"
+          ><el-input
+            v-model="form.country"
+            maxlength="2"
+            placeholder="两位国家代码，如 CN" /></el-form-item
+        ><el-form-item label="省 / 州（ST）"
+          ><el-input v-model="form.state" maxlength="128" /></el-form-item
+        ><el-form-item label="城市（L）"
+          ><el-input v-model="form.locality" maxlength="128" /></el-form-item
+        ><el-form-item label="组织（O）"
+          ><el-input v-model="form.organization" maxlength="128" /></el-form-item
+        ><el-form-item label="部门（OU）"
+          ><el-input v-model="form.organizationalUnit" maxlength="128"
+        /></el-form-item>
+      </div>
+      <div class="form-grid">
+        <el-form-item label="用途"
+          ><el-select v-model="form.purpose"
+            ><el-option label="AS2" value="AS2" /><el-option
+              label="HTTPS"
+              value="HTTPS" /><el-option label="通用" value="GENERAL" /></el-select></el-form-item
+        ><el-form-item label="有效天数"
+          ><el-input-number v-model="form.days" :min="1" :max="36500"
+        /></el-form-item>
+      </div>
+      <el-form-item v-if="kind === 'LEAF'" label="SAN（HTTPS 必填，域名/IP，用逗号分隔）"
+        ><el-input v-model="form.sans"
+      /></el-form-item>
+      <p class="sub">RSA 3072 · SHA256withRSA · 私钥加密保存。有效期不得超过签发者。</p></el-form
+    ><template #footer
+      ><el-button @click="model = false">取消</el-button
+      ><el-button
+        type="primary"
+        :loading="busy"
+        :disabled="kind !== 'ROOT' && !form.issuerId"
+        @click="save"
+        >创建证书</el-button
+      ></template
+    ></el-dialog
+  >
+</template>

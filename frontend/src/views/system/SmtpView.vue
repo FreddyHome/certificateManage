@@ -1,0 +1,77 @@
+<script setup lang="ts">
+import { reactive, onMounted, ref } from 'vue';
+import { request } from '../../api/client';
+import { run } from '../../composables/useAsyncAction';
+import { ElMessage } from 'element-plus';
+const form = reactive({
+    host: '',
+    port: 587,
+    tlsMode: 'STARTTLS',
+    username: '',
+    password: '',
+    sender: '',
+    credentialConfigured: false,
+  }),
+  recipient = ref(''),
+  busy = ref(false);
+onMounted(() => run(async () => Object.assign(form, await request('/system/smtp'))));
+function save() {
+  run(async () => {
+    await request('/system/smtp', 'PUT', form);
+    form.password = '';
+    Object.assign(form, await request('/system/smtp'));
+    ElMessage.success('SMTP配置已保存');
+  });
+}
+function test() {
+  run(async () => {
+    busy.value = true;
+    try {
+      await request('/system/smtp/test', 'POST', { recipient: recipient.value });
+      ElMessage.success('测试邮件已发送');
+    } finally {
+      busy.value = false;
+    }
+  });
+}
+</script>
+<template>
+  <h1>SMTP配置</h1>
+  <p class="sub">通知服务共用此邮件服务配置</p>
+  <div class="panel">
+    <el-form label-position="top"
+      ><div class="form-grid">
+        <el-form-item label="SMTP服务器" required><el-input v-model="form.host" /></el-form-item
+        ><el-form-item label="端口"
+          ><el-input-number v-model="form.port" :min="1" :max="65535" /></el-form-item
+        ><el-form-item label="传输加密"
+          ><el-select v-model="form.tlsMode"
+            ><el-option label="STARTTLS" value="STARTTLS" /><el-option
+              label="TLS"
+              value="TLS" /></el-select></el-form-item
+        ><el-form-item label="发件邮箱" required><el-input v-model="form.sender" /></el-form-item
+        ><el-form-item label="账号"><el-input v-model="form.username" /></el-form-item
+        ><el-form-item
+          :label="form.credentialConfigured ? '认证密码（已保存，留空不修改）' : '认证密码'"
+          ><el-input
+            v-model="form.password"
+            type="password"
+            show-password
+            autocomplete="new-password"
+        /></el-form-item>
+      </div>
+      <el-button type="primary" @click="save">保存配置</el-button></el-form
+    >
+  </div>
+  <div class="panel">
+    <h2>发送测试邮件</h2>
+    <p class="sub">使用已保存的SMTP配置</p>
+    <div class="toolbar">
+      <el-input v-model="recipient" placeholder="测试收件邮箱" /><el-button
+        :loading="busy"
+        @click="test"
+        >发送测试邮件</el-button
+      >
+    </div>
+  </div>
+</template>

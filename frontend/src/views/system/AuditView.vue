@@ -1,0 +1,147 @@
+<script setup lang="ts">
+import { ref, onMounted } from 'vue';
+import { useRoute } from 'vue-router';
+import { request } from '../../api/client';
+import { run } from '../../composables/useAsyncAction';
+import { date } from '../../utils/format';
+const route = useRoute(),
+  source = ref(''),
+  outcome = ref(''),
+  runId = ref<number | undefined>(route.query.runId ? Number(route.query.runId) : undefined),
+  times = ref<string[]>([]),
+  page = ref(1),
+  total = ref(0),
+  rows = ref<any[]>([]),
+  loading = ref(false);
+const sources: Record<string, string> = {
+  SYNC: '证书同步',
+  SERVER: '服务器测试',
+  SMTP: '邮件发送',
+  NOTIFICATION: '到期通知',
+  SCHEDULER: '后台调度',
+  OPERATION: '操作审计',
+};
+const results: Record<string, string> = {
+  STARTED: '开始',
+  SUCCESS: '成功',
+  FAILURE: '失败',
+  SKIPPED: '跳过',
+  INTERRUPTED: '中断',
+  INFO: '信息',
+};
+const fields: Record<string, string> = {
+  elapsedMs: '耗时(ms)',
+  bytes: '字节数',
+  entries: '条目数',
+  filename: '文件名',
+  statusCode: 'HTTP状态码',
+  serverAlias: '服务器',
+  triggerType: '触发方式',
+  revision: '配置修订号',
+  count: '数量',
+  attempt: '尝试次数',
+  deliveryId: '投递ID',
+  thresholdDays: '提醒天数',
+  errorType: '异常类型',
+};
+async function load() {
+  loading.value = true;
+  try {
+    const q = new URLSearchParams({ page: String(page.value), size: '50' });
+    if (source.value) q.set('source', source.value);
+    if (outcome.value) q.set('outcome', outcome.value);
+    if (runId.value) q.set('runId', String(runId.value));
+    if (times.value?.length === 2) {
+      q.set('from', new Date(times.value[0]!).toISOString());
+      q.set('to', new Date(times.value[1]!).toISOString());
+    }
+    const data = await request('/execution-logs?' + q);
+    rows.value = data.items;
+    total.value = data.total;
+  } finally {
+    loading.value = false;
+  }
+}
+function search() {
+  page.value = 1;
+  run(load);
+}
+onMounted(() => run(load));
+</script>
+<template>
+  <div class="page-heading">
+    <div>
+      <h1>审计日志</h1>
+      <p class="sub">执行事件持久化保存，包含成功、失败、跳过及中断；凭据与报文内容不记录。</p>
+    </div>
+  </div>
+  <div class="panel toolbar" style="flex-wrap: wrap">
+    <el-select v-model="source" clearable placeholder="日志来源" style="width: 150px"
+      ><el-option
+        v-for="(label, value) in sources"
+        :key="value"
+        :label="label"
+        :value="value" /></el-select
+    ><el-select v-model="outcome" clearable placeholder="执行结果" style="width: 130px"
+      ><el-option
+        v-for="(label, value) in results"
+        :key="value"
+        :label="label"
+        :value="value" /></el-select
+    ><el-input-number
+      v-model="runId"
+      :min="1"
+      :controls="false"
+      placeholder="同步执行ID"
+      style="width: 150px"
+    /><el-date-picker
+      v-model="times"
+      type="datetimerange"
+      start-placeholder="开始时间"
+      end-placeholder="结束时间"
+      style="width: 360px"
+    /><el-button type="primary" @click="search">查询</el-button
+    ><el-button @click="run(load)">刷新</el-button>
+  </div>
+  <div class="panel">
+    <el-table :data="rows" v-loading="loading" empty-text="暂无审计日志"
+      ><el-table-column label="时间" min-width="180"
+        ><template #default="{ row }">{{ date(row.occurredAt) }}</template></el-table-column
+      ><el-table-column label="来源" width="120"
+        ><template #default="{ row }">{{
+          sources[row.source] || row.source
+        }}</template></el-table-column
+      ><el-table-column label="执行人" width="150"
+        ><template #default="{ row }">{{
+          ['system', 'scheduler'].includes(row.actor)
+            ? '系统（定时任务）'
+            : row.actor === 'legacy'
+              ? '历史记录'
+              : row.actor === 'anonymous'
+                ? '未登录用户'
+                : row.actor
+        }}</template></el-table-column
+      ><el-table-column label="结果" width="90"
+        ><template #default="{ row }"
+          ><el-tag
+            :type="
+              row.outcome === 'FAILURE' ? 'danger' : row.outcome === 'SUCCESS' ? 'success' : 'info'
+            "
+            >{{ results[row.outcome] || row.outcome }}</el-tag
+          ></template
+        ></el-table-column
+      ><el-table-column
+        prop="message"
+        label="操作 / 执行内容"
+        min-width="300"
+        show-overflow-tooltip /></el-table
+    ><el-pagination
+      class="pagination"
+      v-model:current-page="page"
+      :total="total"
+      :page-size="50"
+      layout="prev,pager,next,total"
+      @current-change="run(load)"
+    />
+  </div>
+</template>

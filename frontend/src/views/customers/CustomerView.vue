@@ -1,0 +1,81 @@
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref } from 'vue';
+import { ElMessage } from 'element-plus';
+import { run } from '../../composables/useAsyncAction';
+import { listCustomers, saveCustomer, type Customer } from '../../services/customers';
+
+const rows = ref<Customer[]>([]);
+const open = ref(false);
+const query = ref('');
+const form = reactive<Customer>(emptyCustomer());
+
+const filtered = computed(() =>
+  rows.value.filter((row) => row.name.toLowerCase().includes(query.value.toLowerCase())),
+);
+
+function emptyCustomer(): Customer {
+  return { id: 0, name: '', description: '', externalId: '', idType: '' };
+}
+
+async function load(): Promise<void> {
+  rows.value = await listCustomers();
+}
+
+function edit(row?: Customer): void {
+  Object.assign(form, row || emptyCustomer());
+  open.value = true;
+}
+
+function save(): void {
+  run(async () => {
+    await saveCustomer(form);
+    open.value = false;
+    ElMessage.success('客户已保存');
+    await load();
+  });
+}
+
+onMounted(() => run(load));
+</script>
+<template>
+  <div class="page-heading">
+    <h1>客户管理</h1>
+    <el-button type="primary" @click="edit()">新增客户</el-button>
+  </div>
+  <div class="panel">
+    <div class="toolbar">
+      <el-input v-model="query" placeholder="搜索客户名称" clearable />
+    </div>
+    <el-table :data="filtered">
+      <el-table-column prop="name" label="名称" />
+      <el-table-column prop="externalId" label="ID" />
+      <el-table-column prop="idType" label="idType" />
+      <el-table-column prop="description" label="描述" />
+      <el-table-column label="操作" width="100">
+        <template #default="{ row }">
+          <el-button link type="primary" @click="edit(row)">编辑</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+  </div>
+  <el-dialog v-model="open" :title="form.id ? '编辑客户' : '新增客户'" width="500px">
+    <el-form label-position="top">
+      <el-form-item label="名称" required>
+        <el-input v-model="form.name" maxlength="200" />
+      </el-form-item>
+      <el-form-item label="ID（可选）">
+        <el-input v-model="form.externalId" maxlength="200" clearable />
+      </el-form-item>
+      <el-form-item label="idType（可选）">
+        <el-input v-model="form.idType" maxlength="100" clearable />
+      </el-form-item>
+      <el-form-item label="描述">
+        <el-input v-model="form.description" type="textarea" maxlength="2000" :rows="4" />
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="open = false">取消</el-button>
+      <el-button type="primary" @click="save">保存</el-button>
+    </template>
+  </el-dialog>
+</template>
