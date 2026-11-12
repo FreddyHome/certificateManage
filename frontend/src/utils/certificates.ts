@@ -1,0 +1,1 @@
+export function filteredCertificates<T extends {id:number;name:string;notAfter:string;purpose:string;customer?:string}>(rows:T[],query:string,purpose:string):T[]{return rows.filter(r=>(!purpose||r.purpose===purpose)&&`${r.name} ${r.customer||''}`.toLowerCase().includes(query.toLowerCase())).sort((a,b)=>a.notAfter.localeCompare(b.notAfter)||a.id-b.id)}

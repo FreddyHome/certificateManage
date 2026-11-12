@@ -1,0 +1,2 @@
+ALTER TABLE customers ADD COLUMN external_id VARCHAR(200);
+ALTER TABLE customers ADD COLUMN id_type VARCHAR(100);
