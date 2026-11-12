@@ -73,7 +73,7 @@ npm test
 npm run build
 ```
 
-后端源码按业务模块组织在 `src/main/java/com/certmanage`，数据库迁移在 `src/main/resources/db/migration`，前端位于 `frontend/src`，测试位于 `src/test` 和前端 `*.test.ts`。开发时可运行 `mvn spring-boot:run`，前端 `npm run dev` 使用Vite代理访问后端；生产仍统一部署。
+后端源码按业务模块组织在 `src/main/java/com/certmanage`，数据库迁移在 `src/main/resources/db/migration`，前端位于 `frontend/src`，测试位于 `src/test` 和前端 `*.spec.ts`。开发时可运行 `mvn spring-boot:run`，前端 `npm run dev` 使用Vite代理访问后端；生产仍统一部署。
 
 ## 自有证书删除
 
@@ -96,3 +96,33 @@ npm run build
 具体需求和数据模型见 [需求文档](doc/requirements.md)、[设计文档](doc/design.md)、[数据库设计](doc/database-design.md)。验收记录见 [MVP验收](doc/mvp-verification.md)。
 
 服务器与流程同步扩展见 [设计](doc/server-sync-design.md)、[实施计划](doc/server-sync-plan.md)、[同步验收记录](doc/server-sync-verification.md)。
+
+## 开发规范优化记录
+
+项目结构分析、本轮局部重构和后续优先项见 [开发规范分析](doc/code-quality-review.md)，执行范围见 [局部重构计划](doc/code-quality-plan.md)。
+
+## 结构重构与统一检查
+
+客户模块按 HTTP 入口、业务事务、持久化职责划分；证书导入通过客户服务复用客户。同步模块保留任务服务契约，查询和调度分别由专用组件承担。前端同步页面拆为编辑、步骤配置和执行记录组件，业务请求位于 `frontend/src/services`。
+
+完整验证（包含后端测试、前端格式/测试/类型检查与构建、Java 格式检查）：
+
+```powershell
+.\mvnw.cmd -Pproduction verify
+```
+
+运行中的 JAR 不需要为源码检查而停止，可以使用以下不重新打包 JAR 的等价检查：
+
+```powershell
+.\mvnw.cmd -Pproduction test spotless:check
+```
+
+Java 格式检查当前覆盖本轮重构的客户、证书入口/服务和同步任务服务/查询/调度及相关测试，后续模块逐步纳入；修复格式使用 `.\mvnw.cmd spotless:apply`。前端检查覆盖全部 `frontend/src`，修复格式使用 `npm --prefix frontend run format`，单独验证使用 `npm --prefix frontend run verify`。`-DskipTests` 会同时跳过生产构建中的后端测试与前端验证；正常验证请使用默认值。
+
+本批边界和验证结果见 [结构重构记录](doc/structure-refactor.md)。
+
+## 固定 HTTP 同步组件
+
+同步任务现提供通用 HTTP、重载 Keystore 和更新 TNPartner 证书。重载组件固定 GET `/wm/is/cert/reload`，填写 `keyStoreName` 和 `type`；TNPartner组件固定 POST `/wm/tn/partner/cert/update`，选择客户与用途，系统自动生成客户标识及根到终端的 DER Base64 链。客户需在客户管理中配置外部 ID 和 idType。同一客户用途匹配多张时，自动选择整链有效且终端到期最晚的一张。
+
+重载响应 `isError=false`、TN响应 `code=0` 且 HTTP 状态成功时才成功；接口 `message` 在成功与失败时均进入执行日志。配置及验证说明见 [固定 HTTP 组件](doc/fixed-http-components.md)。

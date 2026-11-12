@@ -1,20 +1,84 @@
 <script setup lang="ts">
-import RequestParameters from '../../components/RequestParameters.vue';
-import {ref,onMounted} from 'vue';import {request,run} from '../../api/client';import {ElMessageBox,ElMessage} from 'element-plus';
-const rows=ref<any[]>([]),servers=ref<any[]>([]),certs=ref<any[]>([]),form=ref<any>(null),history=ref<any[]|null>(null),detail=ref<any>(null),validation=ref<any>(null),maps=ref<Record<string,string>>({});
-async function load(){rows.value=await request('/sync-tasks')}onMounted(()=>run(async()=>{await load();servers.value=await request('/servers');const [own,customer]=await Promise.all([request('/certificates?owner=OWN'),request('/certificates?owner=CUSTOMER')]);certs.value=[...own.map((c:any)=>({...c,owner:'OWN'})),...customer.map((c:any)=>({...c,owner:'CUSTOMER'}))]}));
-const label=(c:any)=>[c.commonName||c.name,c.owner==='OWN'?'自有':'客户',c.customer,c.serial].filter(Boolean).join(' · ');
-function key(){return Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,'0')).join('')}function edit(r?:any){run(async()=>{form.value=r?await request('/sync-tasks/'+r.id):{name:'',description:'',state:'DRAFT',scheduleEnabled:false,cron:'0 0 2 * * *',timezone:'Asia/Shanghai',steps:[]};maps.value={};for(const s of form.value.steps)for(const f of ['headers','fields','query'])maps.value[s.key+f]=JSON.stringify(s.config[f]||{},null,2);validation.value=null})}
-function add(type:string){const s={key:key(),name:type,type,config:type==='KEYSTORE'||type==='TRUSTSTORE'?{format:'PKCS12',filename:'certificates.p12',password:'',keyPassword:'',entries:[]}:{serverId:null,sourceStep:'',certificateId:null,exportFormat:'PEM',filename:'certificate.pem',remoteDirectory:'/',overwrite:false,path:'/',method:type==='HTTP'?'GET':'POST',bodyMode:type==='HTTP'?'NONE':'MULTIPART',fileField:'file',headers:{},fields:{},query:{},body:'',successCodes:[200,201,204]}};form.value.steps.push(s);for(const f of ['headers','fields','query'])maps.value[s.key+f]='{}'}
-function move(i:number,d:number){const a=form.value.steps;if(i+d>=0&&i+d<a.length)[a[i],a[i+d]]=[a[i+d],a[i]]}function duplicate(s:any){const copy=JSON.parse(JSON.stringify(s));copy.key=key();copy.name+=' 副本';form.value.steps.push(copy);for(const f of ['headers','fields','query'])maps.value[copy.key+f]=maps.value[s.key+f]||'{}'}
-async function save(){for(const s of form.value.steps)if(s.type==='HTTP')for(const f of ['headers','fields','query'])s.config[f]=JSON.parse(maps.value[s.key+f]||'{}');const result=await request('/sync-tasks'+(form.value.id?'/'+form.value.id:''),form.value.id?'PUT':'POST',form.value);form.value=await request('/sync-tasks/'+(result.id||form.value.id));await load();ElMessage.success('已保存')}
-function validate(){run(async()=>{await save();validation.value=await request('/sync-tasks/'+form.value.id+'/validate','POST')})}function execute(r:any){run(async()=>{const x=await request('/sync-tasks/'+r.id+'/execute','POST');detail.value=await request('/sync-runs/'+x.id)})}function runs(r:any){run(async()=>{history.value=await request('/sync-tasks/'+r.id+'/runs')})}async function remove(r:any){try{await ElMessageBox.confirm('删除任务 '+r.name+'？','确认')}catch{return}run(async()=>{await request('/sync-tasks/'+r.id,'DELETE');await load()})}
-const status=(v:string)=>({DRAFT:'草稿',READY:'就绪',QUEUED:'排队中',RUNNING:'执行中',SUCCEEDED:'成功',SUCCESS:'成功',FAILED:'失败',INTERRUPTED:'已中断',SKIPPED:'已跳过'} as Record<string,string>)[v]||v;
-</script>
-<template><div class="page-heading"><h1>证书同步</h1><el-button type="primary" @click="edit()">新增任务</el-button></div><div class="panel"><el-table :data="rows"><el-table-column prop="name" label="任务"/><el-table-column label="状态"><template #default="{row}">{{status(row.state)}}</template></el-table-column><el-table-column prop="scheduleEnabled" label="定时启用"/><el-table-column prop="cron" label="Cron"/><el-table-column prop="timezone" label="时区"/><el-table-column label="最近状态"><template #default="{row}">{{status(row.lastStatus)}}</template></el-table-column><el-table-column prop="nextFireAt" label="下次执行"/><el-table-column label="操作" width="300"><template #default="{row}"><el-button link @click="edit(row)">编辑</el-button><el-button link :disabled="row.state!=='READY'" @click="execute(row)">执行</el-button><el-button link @click="runs(row)">记录</el-button><el-button link type="danger" @click="remove(row)">删除</el-button></template></el-table-column></el-table></div>
-<el-dialog :model-value="!!form" @close="form=null" title="同步流程" width="1000px"><el-form v-if="form" label-position="top"><el-form-item label="名称"><el-input v-model="form.name"/></el-form-item><el-form-item label="说明"><el-input v-model="form.description"/></el-form-item><el-form-item label="状态"><el-select v-model="form.state"><el-option label="草稿" value="DRAFT"/><el-option label="就绪" value="READY"/></el-select></el-form-item><el-switch v-model="form.scheduleEnabled" active-text="启用定时"/><el-form-item label="六字段 Cron"><el-input v-model="form.cron"/></el-form-item><el-form-item label="时区"><el-input v-model="form.timezone"/></el-form-item>
-<el-card v-for="(s,i) in form.steps" :key="s.key" style="margin:16px 0"><template #header><b>{{Number(i)+1}} · {{s.type}}</b><el-button text @click="move(Number(i),-1)">上移</el-button><el-button text @click="move(Number(i),1)">下移</el-button><el-button text @click="duplicate(s)">复制</el-button><el-button text type="danger" @click="form.steps.splice(i,1)">移除</el-button></template><el-form-item label="步骤名称"><el-input v-model="s.name"/></el-form-item>
-<template v-if="['KEYSTORE','TRUSTSTORE'].includes(s.type)"><el-select v-model="s.config.format"><el-option v-for="f in ['JKS','PKCS12']" :key="f" :value="f" :label="f"/></el-select><el-form-item label="输出文件名"><el-input v-model="s.config.filename"/></el-form-item><el-form-item :label="s.config.passwordConfigured?'Store 密码（留空保留）':'Store 密码'"><el-input v-model="s.config.password" type="password" show-password/></el-form-item><el-form-item v-if="s.type==='KEYSTORE'" label="私钥密码（现有密码留空保留）"><el-input v-model="s.config.keyPassword" type="password" show-password/></el-form-item><div v-for="(e,j) in s.config.entries" :key="j" style="margin:12px 0"><el-select v-model="e.role"><el-option v-if="s.type==='KEYSTORE'" label="私钥" value="PRIVATE"/><el-option label="信任证书" value="TRUST"/></el-select><el-select v-model="e.assetId" filterable placeholder="选择证书" style="width:420px"><el-option v-for="c in certs.filter(c=>e.role!=='PRIVATE'||(c.owner==='OWN'&&c.hasKey))" :key="c.id" :value="c.id" :label="label(c)"/></el-select><el-input v-model="e.alias" placeholder="条目别名" style="width:150px"/><el-checkbox v-model="e.includeChain">包含证书链</el-checkbox><el-button text @click="s.config.entries.splice(j,1)">移除</el-button></div><el-button @click="s.config.entries.push({assetId:null,alias:'',role:s.type==='KEYSTORE'?'PRIVATE':'TRUST',includeChain:false})">添加证书条目</el-button></template>
-<template v-else><el-form-item label="服务器"><el-select v-model="s.config.serverId" filterable><el-option v-for="v in servers.filter(v=>v.type===s.type&&v.enabled)" :key="v.id" :value="v.id" :label="v.alias"/></el-select></el-form-item><template v-if="s.type==='SFTP'"><el-form-item label="SFTP操作"><el-select v-model="s.config.operation" placeholder="上传文件" @change="()=>{s.config.sourceStep='';s.config.certificateId=null}"><el-option label="上传文件" value="UPLOAD"/><el-option label="移动 / 重命名（mv）" value="MOVE"/></el-select></el-form-item><template v-if="s.config.operation!=='MOVE'"><el-form-item label="前置文件步骤（清空可直接导出证书）"><el-select v-model="s.config.sourceStep" clearable @change="s.config.certificateId=null;s.config.filename=form.steps.find((p:any)=>p.key===s.config.sourceStep)?.config.filename||s.config.filename"><el-option v-for="p in form.steps.slice(0,i).filter((p:any)=>['KEYSTORE','TRUSTSTORE'].includes(p.type))" :key="p.key" :value="p.key" :label="p.name"/></el-select></el-form-item><template v-if="!s.config.sourceStep"><el-select v-model="s.config.certificateId" clearable filterable placeholder="直接导出证书"><el-option v-for="c in certs" :key="c.id" :value="c.id" :label="label(c)"/></el-select><el-select v-model="s.config.exportFormat"><el-option v-for="f in ['PEM','CHAIN_PEM','DER','P7B']" :key="f" :value="f"/></el-select></template><el-form-item label="文件名"><el-input v-model="s.config.filename"/></el-form-item></template></template><template v-if="s.config.operation==='MOVE'"><el-form-item label="源文件路径"><el-input v-model="s.config.sourcePath" placeholder="/path/old.p12"/></el-form-item><el-form-item label="目标文件路径"><el-input v-model="s.config.targetPath" placeholder="/path/new.p12"/></el-form-item></template><template v-if="s.type==='SFTP'"><el-form-item v-if="s.config.operation!=='MOVE'" label="远程目录"><el-input v-model="s.config.remoteDirectory"/></el-form-item><el-checkbox v-model="s.config.overwrite">覆盖已有文件</el-checkbox></template><template v-else><el-form-item label="请求路径"><el-input v-model="s.config.path"/></el-form-item><el-select v-model="s.config.method" placeholder="Method" @change="()=>{if(['GET','HEAD'].includes(s.config.method))s.config.bodyMode='NONE'}"><el-option v-for="m in ['GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS']" :key="m" :value="m"/></el-select><el-select v-if="!['GET','HEAD'].includes(s.config.method)" v-model="s.config.bodyMode" placeholder="请求体类型" :disabled="['GET','HEAD'].includes(s.config.method)"><el-option v-for="m in ['NONE','JSON','FORM','MULTIPART','BINARY','TEXT']" :key="m" :value="m"/></el-select><el-form-item v-if="s.config.bodyMode==='MULTIPART'" label="文件字段名"><el-input v-model="s.config.fileField"/></el-form-item><el-form-item v-for="f in ['headers','fields','query']" :key="f" :label="({headers:'请求头 Headers',fields:'表单参数',query:'查询参数 Query'} as any)[f]" v-show="f!=='fields'||['FORM','MULTIPART'].includes(s.config.bodyMode)"><RequestParameters :model-value="JSON.parse(maps[s.key+f]||'{}')" @update:model-value="maps[s.key+f]=JSON.stringify($event)"/></el-form-item><el-form-item v-if="['JSON','TEXT'].includes(s.config.bodyMode)" label="请求正文（支持 ${fileBase64} 和 ${certificateBase64}）"><el-input v-model="s.config.body" type="textarea" :rows="4"/></el-form-item><el-form-item label="成功 HTTP 状态码"><el-select v-model="s.config.successCodes" multiple filterable allow-create><el-option v-for="c in [200,201,202,204]" :key="c" :value="c" :label="String(c)"/></el-select></el-form-item><el-form-item label="响应 JSONPath"><el-input v-model="s.config.jsonPath"/></el-form-item><el-form-item label="预期值"><el-input v-model="s.config.expectedValue"/></el-form-item></template></template></el-card><el-button v-for="t in ['KEYSTORE','TRUSTSTORE','SFTP','HTTP']" :key="t" @click="add(t)">添加 {{t}}</el-button><section v-if="validation"><el-alert :title="validation.valid?'校验通过':'校验失败'" :type="validation.valid?'success':'error'" :closable="false"/><p>下次定时执行：{{(validation.nextTimes||[]).join('、')||'未启用定时'}}</p><el-table v-if="validation.entries" :data="validation.entries.flatMap((g:any)=>(g.entries||[]).map((e:any)=>({...e,stepName:g.step})))"><el-table-column prop="stepName" label="步骤"/><el-table-column prop="alias" label="别名"/><el-table-column prop="assetId" label="证书ID"/><el-table-column prop="role" label="角色"/></el-table></section></el-form><template #footer><el-button @click="validate">保存并校验</el-button><el-button type="primary" @click="run(save)">保存</el-button></template></el-dialog>
-<el-dialog :model-value="history!==null" @close="history=null" title="执行记录" width="850px"><el-table :data="history||[]"><el-table-column prop="id" label="执行ID"/><el-table-column label="状态"><template #default="{row}">{{status(row.status)}}</template></el-table-column><el-table-column prop="startedAt" label="开始时间"/><el-table-column label="详情"><template #default="{row}"><el-button link @click="run(async()=>{detail=await request('/sync-runs/'+row.id)})">查看 / 刷新</el-button></template></el-table-column></el-table></el-dialog><el-dialog :model-value="!!detail" @close="detail=null" title="执行详情" width="800px"><el-button @click="run(async()=>{detail=await request('/sync-runs/'+detail.id)})">刷新</el-button><template v-if="detail"><el-button @click="()=>{ $router.push({path:'/system/audit',query:{runId:detail.id}});detail=null;history=null }">查看执行审计日志</el-button><p>执行 #{{detail.id}} · {{status(detail.status)}}</p><p>开始：{{detail.startedAt||'—'}}　结束：{{detail.finishedAt||'—'}}</p><p v-if="detail.errorSummary||detail.errorMessage||detail.message">{{detail.errorSummary||detail.errorMessage||detail.message}}</p><el-table :data="detail.steps||[]"><el-table-column prop="name" label="步骤"/><el-table-column prop="type" label="组件"/><el-table-column label="状态"><template #default="{row}">{{status(row.status)}}</template></el-table-column><el-table-column prop="startedAt" label="开始"/><el-table-column prop="finishedAt" label="结束"/><el-table-column label="结果"><template #default="{row}">{{row.errorSummary||row.errorMessage||row.message||row.summary||row.result?.message||row.result?.statusCode||'—'}}</template></el-table-column></el-table></template></el-dialog></template>
+import { useRouter } from 'vue-router';
+import { run } from '../../composables/useAsyncAction';
+import SyncTaskEditor from './SyncTaskEditor.vue';
+import SyncRunHistory from './SyncRunHistory.vue';
+import SyncRunDetail from './SyncRunDetail.vue';
+import { syncStatus as status } from './sync-editor';
+import { useSyncTasks } from './useSyncTasks';
 
+const router = useRouter();
+const {
+  rows,
+  servers,
+  certs,
+  customers,
+  form,
+  history,
+  detail,
+  validation,
+  maps,
+  edit,
+  add,
+  move,
+  duplicate,
+  save,
+  validate,
+  execute,
+  runs,
+  remove,
+  viewRun,
+} = useSyncTasks();
+
+function viewAudit(id: number) {
+  router.push({ path: '/system/audit', query: { runId: id } });
+  detail.value = null;
+  history.value = null;
+}
+</script>
+
+<template>
+  <div class="page-heading">
+    <h1>证书同步</h1>
+    <el-button type="primary" @click="edit()">新增任务</el-button>
+  </div>
+  <div class="panel">
+    <el-table :data="rows">
+      <el-table-column prop="name" label="任务" />
+      <el-table-column label="状态">
+        <template #default="{ row }">{{ status(row.state) }}</template>
+      </el-table-column>
+      <el-table-column prop="scheduleEnabled" label="定时启用" />
+      <el-table-column prop="cron" label="Cron" />
+      <el-table-column prop="timezone" label="时区" />
+      <el-table-column label="最近状态">
+        <template #default="{ row }">{{ status(row.lastStatus) }}</template>
+      </el-table-column>
+      <el-table-column prop="nextFireAt" label="下次执行" />
+      <el-table-column label="操作" width="300">
+        <template #default="{ row }">
+          <el-button link @click="edit(row)">编辑</el-button>
+          <el-button link :disabled="row.state !== 'READY'" @click="execute(row)">执行</el-button>
+          <el-button link @click="runs(row)">记录</el-button>
+          <el-button link type="danger" @click="remove(row)">删除</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+  </div>
+  <SyncTaskEditor
+    :form="form"
+    :servers="servers"
+    :certs="certs"
+    :customers="customers"
+    :maps="maps"
+    :validation="validation"
+    @close="form = null"
+    @save="run(save)"
+    @validate="validate"
+    @add="add"
+    @move="move"
+    @duplicate="duplicate"
+  />
+  <SyncRunHistory :history="history" @close="history = null" @view="viewRun" />
+  <SyncRunDetail :detail="detail" @close="detail = null" @refresh="viewRun" @audit="viewAudit" />
+</template>
