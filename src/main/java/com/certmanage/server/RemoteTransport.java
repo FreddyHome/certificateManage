@@ -1,6 +1,7 @@
 package com.certmanage.server;
 
 import com.certmanage.common.Errors;
+import com.certmanage.common.RawExecutionLog;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.*;
 import java.net.*;
@@ -14,7 +15,7 @@ import org.springframework.stereotype.Service;
 
 @Service
 /**
- * @description 执行远端HTTP与SFTP调用并提供安全诊断
+ * @description 执行远端HTTP、SFTP和SSH命令调用并提供安全诊断
  * @author Freddy
  * @date 2026-11-12
  */
@@ -104,16 +105,57 @@ public class RemoteTransport {
    */
   public Map<String, Object> execute(
       long serverId, long configId, Map<String, Object> step, byte[] data, String filename) {
+    Errors.require(!"READ".equals(step.get("operation")), "读取操作必须使用文件输出入口");
     Errors.require(servers.enabled(serverId), "服务器已停用");
     var c = servers.connection(configId);
     try {
+      if ("SSH".equals(c.get("type"))) return SshCommandTransport.call(c, step, false);
       return "SFTP".equals(c.get("type"))
-          ? sftp(c, step, data, filename, false)
+          ? sftp(c, step, data, filename, false, 0).metadata()
           : http(c, step, data, filename, false);
     } catch (Exception e) {
+      RawExecutionLog.exception(e);
       throw RemoteFailure.of(str(c, "type", "REMOTE"), "REMOTE_CALL", c, e);
     }
   }
+
+  /**
+   * @description 读取冻结服务器版本的远端文件，将原始字节交给流程内存产物上下文
+   * @author Freddy
+   * @date 2026-11-13
+   * @param serverId 服务器标识，必须仍然启用
+   * @param configId 冻结连接版本标识
+   * @param step 包含 READ 操作及 sourcePath 的步骤配置
+   * @param maxBytes 当前流程允许读取的最大字节数，不超过 10 MiB
+   * @return 文件内容、原文件名及源路径；原文另存加密审计详情
+   */
+  public RemoteFile readFile(long serverId, long configId, Map<String, Object> step, int maxBytes) {
+    Errors.require(servers.enabled(serverId), "服务器已停用");
+    Errors.require("READ".equals(step.get("operation")), "读取操作类型错误");
+    Errors.require(maxBytes >= 0 && maxBytes <= 10 * 1024 * 1024, "文件读取限制不合法");
+    var connection = servers.connection(configId);
+    Errors.require("SFTP".equals(connection.get("type")), "读取文件必须选择 SFTP 服务器");
+    try {
+      return sftp(connection, step, null, null, false, maxBytes).file();
+    } catch (Exception failure) {
+      RawExecutionLog.exception(failure);
+      throw RemoteFailure.of("SFTP", "READ", connection, failure);
+    }
+  }
+
+  /**
+   * @description 仅在执行内存中传递远端文件，元数据与原始内容分别处理
+   * @author Freddy
+   * @date 2026-11-13
+   */
+  public record RemoteFile(byte[] bytes, String filename, String sourcePath) {}
+
+  /**
+   * @description 分离普通结果中的 SFTP 元数据与另存加密审计的文件正文
+   * @author Freddy
+   * @date 2026-11-13
+   */
+  private record SftpResult(Map<String, Object> metadata, RemoteFile file) {}
 
   /**
    * @description 测试服务器连接并返回安全诊断
@@ -127,13 +169,24 @@ public class RemoteTransport {
     var c = servers.connection(((Number) snap.get("configId")).longValue());
     long begin = System.nanoTime();
     try {
+      if ("SSH".equals(c.get("type"))) {
+        var connected = SshCommandTransport.call(c, Map.of(), true);
+        return Map.of(
+            "success",
+            true,
+            "elapsedMs",
+            (System.nanoTime() - begin) / 1000000,
+            "result",
+            connected);
+      }
       var result =
           "SFTP".equals(c.get("type"))
-              ? sftp(c, Map.of(), null, null, true)
+              ? sftp(c, Map.of(), null, null, true, 0).metadata()
               : http(c, Map.of(), null, null, true);
       return Map.of(
           "success", true, "elapsedMs", (System.nanoTime() - begin) / 1000000, "result", result);
     } catch (Exception e) {
+      RawExecutionLog.exception(e);
       var failure = RemoteFailure.of(str(c, "type", "REMOTE"), "REMOTE_CALL", c, e);
       return Map.of(
           "success",
@@ -150,7 +203,7 @@ public class RemoteTransport {
   }
 
   /**
-   * @description 执行SFTP连接测试或文件操作
+   * @description 复用认证连接与超时，执行 SFTP 测试、上传、移动或有界文件读取
    * @author Freddy
    * @date 2026-11-12
    * @param c 组件配置
@@ -158,15 +211,78 @@ public class RemoteTransport {
    * @param data 待发送文件字节，可为空
    * @param filename 安全文件名
    * @param test 是否仅测试连接
-   * @return 无效配置时抛出异常，否则返回处理结果
+   * @param maxBytes 读取操作的最大字节数，其他操作忽略
+   * @return 元数据及可选的内存文件，文件正文另存加密审计详情
    * @throws Exception 远端操作、证书解析或文件处理失败
    */
-  Map<String, Object> sftp(
-      Map<String, Object> c, Map<String, Object> step, byte[] data, String filename, boolean test)
+  private SftpResult sftp(
+      Map<String, Object> c,
+      Map<String, Object> step,
+      byte[] data,
+      String filename,
+      boolean test,
+      int maxBytes)
       throws Exception {
     String stage = "CONNECT";
+    var raw = RawExecutionLog.sink();
+    raw.record(
+        "SFTP_CONNECT",
+        "SFTP连接请求",
+        Map.of(
+            "host",
+            c.get("host"),
+            "port",
+            c.get("port"),
+            "username",
+            str(c, "username", ""),
+            "authType",
+            str(c, "authType", "PASSWORD")));
     var timedOut = new java.util.concurrent.atomic.AtomicBoolean();
     try (var client = SshClient.setUpDefaultClient()) {
+      client.addSessionListener(
+          new org.apache.sshd.common.session.SessionListener() {
+            @Override
+            public void sessionEvent(
+                org.apache.sshd.common.session.Session session,
+                org.apache.sshd.common.session.SessionListener.Event event) {
+              raw.record(
+                  "SSH_SESSION",
+                  "SSH会话事件",
+                  Map.of("event", event.name(), "session", session.toString()));
+            }
+
+            @Override
+            public void sessionException(
+                org.apache.sshd.common.session.Session session, Throwable failure) {
+              raw.exception(failure);
+            }
+
+            @Override
+            public void sessionDisconnect(
+                org.apache.sshd.common.session.Session session,
+                int reason,
+                String message,
+                String language,
+                boolean initiator) {
+              raw.record(
+                  "SSH_DISCONNECT",
+                  "SSH断开连接",
+                  Map.of(
+                      "reason",
+                      reason,
+                      "message",
+                      Objects.toString(message, ""),
+                      "language",
+                      Objects.toString(language, ""),
+                      "initiator",
+                      initiator));
+            }
+
+            @Override
+            public void sessionClosed(org.apache.sshd.common.session.Session session) {
+              raw.record("SSH_SESSION", "SSH会话关闭", Map.of("session", session.toString()));
+            }
+          });
       client.setServerKeyVerifier((session, address, key) -> true);
       org.apache.sshd.sftp.client.impl.AbstractSftpClient.SFTP_CLIENT_CMD_TIMEOUT.set(
           client, Duration.ofSeconds(((Number) c.get("readTimeout")).longValue()));
@@ -191,6 +307,10 @@ public class RemoteTransport {
                   },
                   ((Number) c.get("readTimeout")).longValue())) {
         stage = "KEY_LOADING";
+        raw.record(
+            "SFTP_CONNECT",
+            "SFTP连接成功",
+            Map.of("remoteAddress", session.getIoSession().getRemoteAddress().toString()));
         if ("KEY".equals(c.get("authType"))) {
           var keys =
               org.apache.sshd.common.util.security.SecurityUtils.loadKeyPairIdentities(
@@ -203,13 +323,87 @@ public class RemoteTransport {
           for (var key : keys) session.addPublicKeyIdentity(key);
         } else session.addPasswordIdentity(str(c, "password", ""));
         stage = "AUTH";
+        raw.record(
+            "SFTP_AUTH",
+            "SFTP认证开始",
+            Map.of("username", str(c, "username", ""), "authType", str(c, "authType", "PASSWORD")));
         session.auth().verify(Duration.ofSeconds(((Number) c.get("readTimeout")).longValue()));
+        raw.record("SFTP_AUTH", "SFTP认证成功", Map.of("authenticated", session.isAuthenticated()));
         stage = "SFTP_SESSION";
         try (var ftp = SftpClientFactory.instance().createSftpClient(session)) {
-          if (test) return Map.of("connected", true);
+          if (test) return new SftpResult(Map.of("connected", true), null);
           stage = "UPLOAD";
           String operation = str(step, "operation", "UPLOAD");
-          Errors.require(Set.of("UPLOAD", "MOVE").contains(operation), "SFTP操作类型不合法");
+          raw.record(
+              "SFTP_REQUEST",
+              "SFTP操作请求",
+              Map.of(
+                  "operation",
+                  operation,
+                  "config",
+                  step,
+                  "filename",
+                  Objects.toString(filename, ""),
+                  "bodyBase64",
+                  data == null ? "" : Base64.getEncoder().encodeToString(data),
+                  "bytes",
+                  data == null ? 0 : data.length));
+          Errors.require(Set.of("UPLOAD", "MOVE", "READ").contains(operation), "SFTP操作类型不合法");
+          if (operation.equals("READ")) {
+            stage = "READ";
+            String path = str(step, "sourcePath", "");
+            Errors.require(
+                path.startsWith("/")
+                    && !path.endsWith("/")
+                    && !path.contains("\\")
+                    && !path.codePoints().anyMatch(Character::isISOControl)
+                    && !Arrays.asList(path.split("/")).contains(".."),
+                "请填写有效的远端绝对文件路径");
+            String originalName = path.substring(path.lastIndexOf('/') + 1);
+            Errors.require(!originalName.equals(".") && originalName.length() <= 200, "文件名不合法");
+            var attributes = ftp.lstat(path);
+            raw.record(
+                "SFTP_STAT",
+                "SFTP文件属性",
+                Map.of(
+                    "path",
+                    path,
+                    "size",
+                    attributes.getSize(),
+                    "permissions",
+                    attributes.getPermissions(),
+                    "regularFile",
+                    attributes.isRegularFile()));
+            if (!attributes.isRegularFile())
+              throw new RemoteFailure("NOT_REGULAR_FILE", stage, "读取路径必须为普通文件");
+            if (attributes.getSize() > maxBytes)
+              throw new RemoteFailure("FILE_TOO_LARGE", stage, "远端文件超过当前流程允许的读取大小");
+            byte[] bytes;
+            try (var input = ftp.read(path)) {
+              bytes =
+                  readCaptured(
+                      input,
+                      maxBytes + 1,
+                      (captured, complete) ->
+                          raw.record(
+                              "SFTP_RESPONSE",
+                              "SFTP读取响应",
+                              Map.of(
+                                  "path",
+                                  path,
+                                  "bodyBase64",
+                                  Base64.getEncoder().encodeToString(captured),
+                                  "bytes",
+                                  captured.length,
+                                  "complete",
+                                  complete && captured.length <= maxBytes)));
+            }
+            if (bytes.length > maxBytes) {
+              Arrays.fill(bytes, (byte) 0);
+              throw new RemoteFailure("FILE_TOO_LARGE", stage, "远端文件超过当前流程允许的读取大小");
+            }
+            return new SftpResult(Map.of(), new RemoteFile(bytes, originalName, path));
+          }
           if (operation.equals("MOVE")) {
             String from = str(step, "sourcePath", ""), to = str(step, "targetPath", "");
             for (String path : List.of(from, to))
@@ -229,6 +423,16 @@ public class RemoteTransport {
             }
             Errors.require(!from.equals(to), "源路径和目标路径不能相同");
             Errors.require(ftp.lstat(from).isRegularFile(), "源路径必须为文件");
+            raw.record(
+                "SFTP_COMMAND",
+                "SFTP移动文件",
+                Map.of(
+                    "sourcePath",
+                    from,
+                    "targetPath",
+                    to,
+                    "overwrite",
+                    Boolean.TRUE.equals(step.get("overwrite"))));
             if (Boolean.TRUE.equals(step.get("overwrite")))
               ftp.rename(from, to, SftpClient.CopyMode.Atomic, SftpClient.CopyMode.Overwrite);
             else {
@@ -240,15 +444,21 @@ public class RemoteTransport {
               }
               ftp.rename(from, to);
             }
-            return Map.of(
-                "moved",
-                true,
-                "sourcePath",
-                from,
-                "targetPath",
-                to,
-                "message",
-                "SFTP移动/重命名成功：" + from + " -> " + to);
+            raw.record(
+                "SFTP_RESPONSE",
+                "SFTP移动成功",
+                Map.of("sourcePath", from, "targetPath", to, "success", true));
+            return new SftpResult(
+                Map.of(
+                    "moved",
+                    true,
+                    "sourcePath",
+                    from,
+                    "targetPath",
+                    to,
+                    "message",
+                    "SFTP移动/重命名成功：" + from + " -> " + to),
+                null);
           }
           Errors.require(data != null && data.length <= 16777216, "文件大小不合法");
           Errors.require(
@@ -259,6 +469,10 @@ public class RemoteTransport {
               dir.startsWith("/") && !Arrays.asList(dir.split("/")).contains(".."), "目录不合法");
           String target = dir.replaceAll("/+$", "") + "/" + filename,
               tmp = target + "." + UUID.randomUUID() + ".tmp";
+          raw.record(
+              "SFTP_COMMAND",
+              "SFTP写入临时文件",
+              Map.of("temporaryPath", tmp, "targetPath", target, "bytes", data.length));
           try {
             try (var out =
                 ftp.write(
@@ -268,6 +482,16 @@ public class RemoteTransport {
                     SftpClient.OpenMode.Exclusive)) {
               out.write(data);
             }
+            raw.record(
+                "SFTP_COMMAND",
+                "SFTP提交临时文件",
+                Map.of(
+                    "sourcePath",
+                    tmp,
+                    "targetPath",
+                    target,
+                    "overwrite",
+                    Boolean.TRUE.equals(step.get("overwrite"))));
             if (Boolean.TRUE.equals(step.get("overwrite")))
               ftp.rename(tmp, target, SftpClient.CopyMode.Atomic, SftpClient.CopyMode.Overwrite);
             else {
@@ -280,16 +504,32 @@ public class RemoteTransport {
               }
               ftp.rename(tmp, target);
             }
-            return Map.of("bytes", data.length, "uploaded", true);
+            raw.record(
+                "SFTP_RESPONSE",
+                "SFTP上传成功",
+                Map.of("path", target, "bytes", data.length, "success", true));
+            return new SftpResult(Map.of("bytes", data.length, "uploaded", true), null);
           } finally {
             try {
               ftp.remove(tmp);
+              raw.record("SFTP_CLEANUP", "SFTP临时文件清理成功", Map.of("path", tmp));
             } catch (Exception ignored) {
+              raw.record(
+                  "SFTP_CLEANUP",
+                  "SFTP临时文件清理结果",
+                  Map.of(
+                      "path",
+                      tmp,
+                      "exceptionType",
+                      ignored.getClass().getName(),
+                      "message",
+                      Objects.toString(ignored.getMessage(), "")));
             }
           }
         }
       }
     } catch (Exception failure) {
+      RawExecutionLog.exception(failure);
       if (timedOut.get()) throw new RemoteFailure("TIMEOUT", stage, "SFTP认证或读写超时：请检查服务器响应和超时设置");
       throw RemoteFailure.of("SFTP", stage, c, failure);
     }
@@ -309,6 +549,51 @@ public class RemoteTransport {
    */
   Map<String, Object> http(
       Map<String, Object> c, Map<String, Object> step, byte[] data, String filename, boolean test)
+      throws Exception {
+    return http(c, step, data, filename, test, false);
+  }
+
+  /**
+   * @description 在内存中读取业务HTTP文件响应，沿用服务器鉴权和大小限制
+   * @author Freddy
+   * @date 2026-11-13
+   * @param serverId 来源服务器
+   * @param configId 冻结连接版本
+   * @param step HTTP读取配置
+   * @param maxBytes 允许解码的最大字节数
+   * @return 原始文件和响应路径；原文另存加密审计详情
+   * @throws Exception 响应无效或远端失败
+   */
+  public RemoteFile readHttpFile(
+      long serverId, long configId, Map<String, Object> step, int maxBytes) throws Exception {
+    Errors.require(servers.enabled(serverId), "来源服务器已停用");
+    var result = http(servers.connection(configId), step, null, "", false, true);
+    byte[] bytes = (byte[]) result.get("fileContent");
+    Errors.require(bytes.length <= maxBytes, "文件超过流程大小限制");
+    String path = result.get("path").toString();
+    return new RemoteFile(bytes, path.substring(path.lastIndexOf('/') + 1), path);
+  }
+
+  /**
+   * @description 区分普通请求与仅在内存返回文件内容的业务读取
+   * @author Freddy
+   * @date 2026-11-13
+   * @param c 服务器连接
+   * @param step 请求配置
+   * @param data 请求文件
+   * @param filename 文件名
+   * @param test 是否连通测试
+   * @param readFile 是否读取业务文件
+   * @return 请求结果或仅供调用方消费的文件数据
+   * @throws Exception 请求或响应校验失败
+   */
+  private Map<String, Object> http(
+      Map<String, Object> c,
+      Map<String, Object> step,
+      byte[] data,
+      String filename,
+      boolean test,
+      boolean readFile)
       throws Exception {
     String path = str(test ? c : step, test ? "testPath" : "path", "/");
     Errors.require(
@@ -461,7 +746,23 @@ public class RemoteTransport {
             .connectTimeout(Duration.ofSeconds(((Number) c.get("connectTimeout")).longValue()))
             .followRedirects(HttpClient.Redirect.NEVER)
             .build()) {
-      var response = client.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
+      var request = builder.build();
+      var raw = RawExecutionLog.sink();
+      raw.record(
+          "HTTP_REQUEST",
+          "HTTP请求",
+          Map.of(
+              "url",
+              request.uri().toString(),
+              "method",
+              request.method(),
+              "headers",
+              request.headers().map(),
+              "bodyBase64",
+              Base64.getEncoder().encodeToString(body),
+              "bytes",
+              body.length));
+      var response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
       byte[] bytes;
       try (var in = response.body();
           var deadline =
@@ -474,14 +775,38 @@ public class RemoteTransport {
                   },
                   ((Number) c.get("readTimeout")).longValue())) {
         try {
-          bytes = in.readNBytes(1048577);
+          int responseLimit = readFile ? 14 * 1024 * 1024 : 1048576;
+          bytes =
+              readCaptured(
+                  in,
+                  responseLimit + 1,
+                  (captured, complete) ->
+                      raw.record(
+                          "HTTP_RESPONSE",
+                          "HTTP响应",
+                          Map.of(
+                              "url",
+                              response.uri().toString(),
+                              "statusCode",
+                              response.statusCode(),
+                              "version",
+                              response.version().toString(),
+                              "headers",
+                              response.headers().map(),
+                              "bodyBase64",
+                              Base64.getEncoder().encodeToString(captured),
+                              "bytes",
+                              captured.length,
+                              "complete",
+                              complete && captured.length <= responseLimit)));
         } catch (IOException failure) {
+          RawExecutionLog.exception(failure);
           if (deadline.expired)
             throw new RemoteFailure("TIMEOUT", "HTTP_RESPONSE", "HTTP响应内容读取超时：请检查接口响应和超时设置");
           throw failure;
         }
       }
-      Errors.require(bytes.length <= 1048576, "响应过大");
+      Errors.require(bytes.length <= (readFile ? 14 * 1024 * 1024 : 1048576), "响应过大");
       Object codes = (test ? c : step).get(test ? "testCodes" : "successCodes");
       boolean success =
           codes instanceof Collection<?> cs && !cs.isEmpty()
@@ -490,7 +815,9 @@ public class RemoteTransport {
               : response.statusCode() >= 200 && response.statusCode() < 300;
       if (!success) {
         String diagnostic = "HTTP响应状态码为 " + response.statusCode() + "，不符合配置的成功状态码";
-        if (!test && !str(step, "httpComponent", "GENERIC").equals("GENERIC")) {
+        if (!test
+            && !Set.of("GENERIC", "BUSINESS_UPDATE")
+                .contains(str(step, "httpComponent", "GENERIC"))) {
           try {
             var failureNode = json.readTree(bytes);
             if (failureNode != null
@@ -502,6 +829,20 @@ public class RemoteTransport {
           }
         }
         throw new RemoteFailure("HTTP_STATUS", "HTTP_RESPONSE", diagnostic);
+      }
+      if (readFile) {
+        var node = json.readTree(bytes);
+        Errors.require(
+            node != null && node.isObject() && node.path("code").asText().equals("0"),
+            "读取接口业务失败或缺少code");
+        Errors.require(
+            node.path("path").isTextual() && !node.path("path").asText().isBlank(), "读取接口缺少path");
+        Errors.require(
+            node.path("content").isTextual() && !node.path("content").asText().isBlank(),
+            "读取接口缺少content");
+        byte[] content = Base64.getDecoder().decode(node.path("content").asText());
+        Errors.require(content.length <= 10 * 1024 * 1024, "文件超过10MiB");
+        return Map.of("path", node.path("path").asText(), "fileContent", content);
       }
       if (!test && !str(step, "httpComponent", "GENERIC").equals("GENERIC"))
         return businessResult(step, c, bytes, response.statusCode(), body.length);
@@ -515,6 +856,37 @@ public class RemoteTransport {
           throw new RemoteFailure("HTTP_RESULT_MISMATCH", "HTTP_RESPONSE", "HTTP返回字段不符合配置的成功判定");
       }
       return Map.of("statusCode", response.statusCode(), "bytes", body.length);
+    }
+  }
+
+  /**
+   * @description 有界读取并在成功或异常时保存实际收到的字节，避免超时丢失已接收内容
+   * @author Freddy
+   * @date 2026-11-13
+   * @param input 远端输入流
+   * @param limit 读取上限，保留额外一字节用于超限判定
+   * @param capture 实际内容和完整性标记接收器
+   * @return 已接收字节
+   * @throws IOException 输入流失败
+   */
+  private static byte[] readCaptured(
+      InputStream input, int limit, java.util.function.BiConsumer<byte[], Boolean> capture)
+      throws IOException {
+    var output = new ByteArrayOutputStream();
+    boolean complete = false;
+    try {
+      var buffer = new byte[8192];
+      while (output.size() < limit) {
+        int count = input.read(buffer, 0, Math.min(buffer.length, limit - output.size()));
+        if (count < 0) {
+          complete = true;
+          break;
+        }
+        output.write(buffer, 0, count);
+      }
+      return output.toByteArray();
+    } finally {
+      capture.accept(output.toByteArray(), complete);
     }
   }
 
@@ -535,6 +907,16 @@ public class RemoteTransport {
       throws Exception {
     var node = json.readTree(bytes);
     String component = str(step, "httpComponent", "");
+    // 新业务接口发送含私钥的证书库，远端message可能回显文件，使用固定摘要避免持久化回显。
+    if (component.equals("BUSINESS_UPDATE")) {
+      if (node == null
+          || !node.isObject()
+          || !(node.path("code").isTextual() || node.path("code").isIntegralNumber()))
+        throw new RemoteFailure("HTTP_INVALID_RESULT", "HTTP_RESPONSE", "更新接口缺少有效code");
+      if (!node.path("code").asText().equals("0"))
+        throw new RemoteFailure("HTTP_BUSINESS_ERROR", "HTTP_RESPONSE", "更新接口返回业务失败，请检查目标系统状态");
+      return Map.of("statusCode", status, "bytes", size, "message", "远端更新接口成功");
+    }
     if (node == null || !node.isObject() || !node.path("message").isTextual())
       throw new RemoteFailure("HTTP_INVALID_RESULT", "HTTP_RESPONSE", "固定业务接口响应格式不合法");
     String message = safeBusinessMessage(node.path("message").asText(), config);

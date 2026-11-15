@@ -1,4 +1,6 @@
 import { onMounted, ref } from 'vue';
+import { createBusinessStep } from './business-editor';
+import type { BusinessComponent } from '../../services/sync-types';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { run } from '../../composables/useAsyncAction';
 import {
@@ -80,6 +82,10 @@ export function useSyncTasks() {
     if (form.value) moveStep(form.value.steps, index, direction);
   }
 
+  function addBusiness(component: BusinessComponent) {
+    if (form.value) form.value.steps.push(createBusinessStep(component));
+  }
+
   function duplicate(step: SyncStep) {
     if (!form.value) return;
     const copy = duplicateStep(step);
@@ -147,6 +153,7 @@ export function useSyncTasks() {
     maps,
     edit,
     add,
+    addBusiness,
     move,
     duplicate,
     save,

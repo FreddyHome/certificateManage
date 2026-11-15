@@ -9,7 +9,8 @@ import type {
 } from '../../services/sync-types';
 import {
   certificateLabel as label,
-  isStoreStep,
+  producesFile,
+  outputFilename,
   parameterFields,
   parameterLabels,
 } from './sync-editor';
@@ -25,9 +26,8 @@ const props = defineProps<{
 
 function selectSource() {
   props.s.config.certificateId = null;
-  props.s.config.filename =
-    props.form.steps.find((step) => step.key === props.s.config.sourceStep)?.config.filename ||
-    props.s.config.filename;
+  const source = props.form.steps.find((step) => step.key === props.s.config.sourceStep);
+  if (source) props.s.config.filename = outputFilename(source) || props.s.config.filename;
 }
 
 function changeOperation() {
@@ -55,34 +55,44 @@ function changeMethod() {
     <el-form-item label="SFTP操作">
       <el-select v-model="s.config.operation" placeholder="上传文件" @change="changeOperation">
         <el-option label="上传文件" value="UPLOAD" />
+        <el-option label="读取文件" value="READ" />
         <el-option label="移动 / 重命名（mv）" value="MOVE" />
       </el-select>
     </el-form-item>
-    <template v-if="s.config.operation !== 'MOVE'">
-      <el-form-item label="前置文件步骤（清空可直接导出证书）">
-        <el-select v-model="s.config.sourceStep" clearable @change="selectSource">
-          <el-option
-            v-for="p in form.steps.slice(0, i).filter(isStoreStep)"
-            :key="p.key"
-            :value="p.key"
-            :label="p.name"
-          />
-        </el-select>
-      </el-form-item>
-      <template v-if="!s.config.sourceStep">
-        <el-select v-model="s.config.certificateId" clearable filterable placeholder="直接导出证书">
-          <el-option v-for="c in certs" :key="c.id" :value="c.id" :label="label(c)" />
-        </el-select>
-        <el-select v-model="s.config.exportFormat">
-          <el-option v-for="f in ['PEM', 'CHAIN_PEM', 'DER', 'P7B']" :key="f" :value="f" />
-        </el-select>
-      </template>
-      <el-form-item label="文件名">
-        <el-input v-model="s.config.filename" />
-      </el-form-item>
-    </template>
   </template>
-  <template v-if="s.config.operation === 'MOVE'">
+  <template v-if="s.type === 'HTTP' || !['MOVE', 'READ'].includes(s.config.operation || 'UPLOAD')">
+    <el-form-item label="文件来源步骤（清空可直接导出证书）">
+      <el-select v-model="s.config.sourceStep" clearable @change="selectSource">
+        <el-option
+          v-for="p in form.steps.slice(0, i).filter(producesFile)"
+          :key="p.key"
+          :value="p.key"
+          :label="p.name"
+        />
+      </el-select>
+    </el-form-item>
+    <template v-if="!s.config.sourceStep">
+      <el-select v-model="s.config.certificateId" clearable filterable placeholder="直接导出证书">
+        <el-option v-for="c in certs" :key="c.id" :value="c.id" :label="label(c)" />
+      </el-select>
+      <el-select v-model="s.config.exportFormat">
+        <el-option v-for="f in ['PEM', 'CHAIN_PEM', 'DER', 'P7B']" :key="f" :value="f" />
+      </el-select>
+    </template>
+    <el-form-item label="文件名">
+      <el-input v-model="s.config.filename" />
+    </el-form-item>
+  </template>
+  <template v-if="s.type === 'SFTP' && s.config.operation === 'READ'">
+    <el-form-item label="远端文件完整路径">
+      <el-input v-model="s.config.sourcePath" placeholder="/path/server.p12" />
+    </el-form-item>
+    <p>输出文件：{{ s.config.sourcePath?.split('/').pop() || '填写路径后自动取原文件名' }}。</p>
+    <p>
+      后续 SFTP 上传或通用 HTTP 可通过“文件来源步骤”选择本步骤。读取保留源文件，单文件上限 10 MB。
+    </p>
+  </template>
+  <template v-if="s.type === 'SFTP' && s.config.operation === 'MOVE'">
     <el-form-item label="源文件路径">
       <el-input v-model="s.config.sourcePath" placeholder="/path/old.p12" />
     </el-form-item>
@@ -95,10 +105,15 @@ function changeMethod() {
     </p>
   </template>
   <template v-if="s.type === 'SFTP'">
-    <el-form-item v-if="s.config.operation !== 'MOVE'" label="远程目录">
+    <el-form-item
+      v-if="!['MOVE', 'READ'].includes(s.config.operation || 'UPLOAD')"
+      label="远程目录"
+    >
       <el-input v-model="s.config.remoteDirectory" />
     </el-form-item>
-    <el-checkbox v-model="s.config.overwrite">覆盖已有文件</el-checkbox>
+    <el-checkbox v-if="s.config.operation !== 'READ'" v-model="s.config.overwrite"
+      >覆盖已有文件</el-checkbox
+    >
   </template>
   <template v-else>
     <el-form-item label="请求路径">

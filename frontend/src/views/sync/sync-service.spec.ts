@@ -27,8 +27,8 @@ describe('同步请求契约', () => {
     const own = { id: 1, commonName: 'own' };
     const customer = { id: 2, commonName: 'customer' };
     requestMock.mockResolvedValueOnce([{ id: 3 }]);
-    requestMock.mockResolvedValueOnce([own]);
-    requestMock.mockResolvedValueOnce([customer]);
+    requestMock.mockResolvedValueOnce([own, { id: 5, enabled: false }]);
+    requestMock.mockResolvedValueOnce([customer, { id: 6, enabled: false }]);
     requestMock.mockResolvedValueOnce([{ id: 9, name: 'customer' }]);
     const options = await loadSyncOptions();
     expect(options.customers).toEqual([{ id: 9, name: 'customer' }]);

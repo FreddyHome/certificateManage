@@ -53,13 +53,16 @@ function submit(save: boolean) {
   run(async () => {
     busy.value = true;
     try {
-      preview.value = await (save
-        ? commitCertificateImport(data())
-        : previewCertificateImport(data()));
       if (save) {
-        ElMessage.success('证书导入成功');
+        const result = await commitCertificateImport(data());
+        ElMessage.success(
+          `导入完成：新增 ${result.importedCount}，跳过 ${result.skippedCount}` +
+            (result.restoredCount ? `，恢复 ${result.restoredCount}` : ''),
+        );
         model.value = false;
         emit('saved');
+      } else {
+        preview.value = await previewCertificateImport(data());
       }
     } finally {
       busy.value = false;
@@ -74,7 +77,11 @@ function submit(save: boolean) {
     width="720px"
     destroy-on-close
     ><el-alert
-      title="名称由证书 CN 自动解析；提交材料需组成完整证书链。"
+      :title="
+        owner === 'OWN'
+          ? '需提交完整证书链；根、中间及叶子证书均按 SHA-256 指纹去重，已存在的节点自动跳过。'
+          : '名称由证书 CN 自动解析；提交材料需组成完整证书链。'
+      "
       type="info"
       :closable="false"
     /><el-radio-group v-model="mode" style="margin: 20px 0"

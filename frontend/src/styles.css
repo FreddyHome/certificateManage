@@ -17,10 +17,24 @@ body {
   background: #001529;
 }
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   color: white;
   font-size: 23px;
   font-weight: 600;
-  padding: 25px 22px;
+  padding: 24px 18px;
+}
+.brand-logo {
+  display: block;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+}
+.brand-copy {
+  min-width: 0;
+  line-height: 1.1;
 }
 .brand small {
   font-size: 12px;

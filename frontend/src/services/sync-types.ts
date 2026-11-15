@@ -2,8 +2,9 @@ import type { Customer } from './customers';
 
 export type SyncCustomer = Customer;
 export type HttpComponent = 'GENERIC' | 'RELOAD_KEYSTORE' | 'UPDATE_TN_PARTNER';
+export type BusinessComponent = 'IS_TRUSTSTORE' | 'IS_KEYSTORE' | 'TN_CERTIFICATE';
 
-export type StepType = 'KEYSTORE' | 'TRUSTSTORE' | 'SFTP' | 'HTTP';
+export type StepType = 'KEYSTORE' | 'TRUSTSTORE' | 'SFTP' | 'HTTP' | 'SSH';
 export type ParameterField = 'headers' | 'fields' | 'query';
 export type ParameterMaps = Record<string, string>;
 export type Parameters = Record<string, unknown>;
@@ -26,6 +27,23 @@ export interface StoreConfig {
 }
 
 export interface TransferConfig {
+  businessComponent?: BusinessComponent;
+  alias?: string;
+  format?: string;
+  storePath?: string;
+  sourceType?: 'SFTP' | 'HTTP';
+  sourceServerId?: number | null;
+  sourceUrl?: string;
+  sourceMethod?: string;
+  sourceHeaders?: Parameters;
+  sourceQuery?: Parameters;
+  selectionMode?: 'AUTO' | 'MANUAL';
+  materialIds?: number[];
+  deleteExpired?: boolean;
+  password?: string;
+  keyPassword?: string;
+  passwordConfigured?: boolean;
+  keyPasswordConfigured?: boolean;
   httpComponent?: HttpComponent;
   keyStoreName?: string;
   type?: string;
@@ -38,7 +56,7 @@ export interface TransferConfig {
   filename: string;
   remoteDirectory: string;
   overwrite: boolean;
-  operation?: 'UPLOAD' | 'MOVE';
+  operation?: 'UPLOAD' | 'MOVE' | 'READ';
   sourcePath?: string;
   targetPath?: string;
   appendTimestamp?: boolean;
@@ -69,7 +87,14 @@ export interface TransferStep {
   config: TransferConfig;
 }
 
-export type SyncStep = StoreStep | TransferStep;
+export interface ShellStep {
+  key: string;
+  name: string;
+  type: 'SSH';
+  config: { serverId: number | null; command: string; timeoutSeconds: number };
+}
+
+export type SyncStep = StoreStep | TransferStep | ShellStep;
 
 export interface SyncTaskSummary {
   id: number;
@@ -91,6 +116,7 @@ export interface SyncTask extends Omit<SyncTaskSummary, 'id' | 'revision'> {
 }
 
 export interface SyncServer {
+  config?: { baseUrl?: string };
   id: number;
   type: string;
   enabled: boolean;
@@ -105,6 +131,23 @@ export interface SyncCertificate {
   customer?: string;
   serial?: string;
   hasKey?: boolean;
+  enabled?: boolean;
+  customerId?: number | null;
+  purpose?: string;
+  kind?: string;
+  notBefore?: string;
+  notAfter?: string;
+  archivedAt?: string | null;
+  chainAvailable?: boolean;
+}
+
+export interface SyncChainNode {
+  materialId: number;
+  name: string;
+  kind: string;
+  serial: string;
+  notBefore: string;
+  notAfter: string;
 }
 
 export interface ValidationEntry {

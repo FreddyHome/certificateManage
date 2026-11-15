@@ -15,7 +15,7 @@ export const parameterLabels: Record<ParameterField, string> = {
   fields: '表单参数',
   query: '查询参数 Query',
 };
-export const stepTypes: StepType[] = ['KEYSTORE', 'TRUSTSTORE', 'SFTP', 'HTTP'];
+export const stepTypes: StepType[] = ['KEYSTORE', 'TRUSTSTORE', 'SFTP', 'HTTP', 'SSH'];
 
 function stepKey() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) =>
@@ -25,6 +25,20 @@ function stepKey() {
 
 export function isStoreStep(step: SyncStep): step is StoreStep {
   return step.type === 'KEYSTORE' || step.type === 'TRUSTSTORE';
+}
+
+/** 只有制作证书库及读取远端文件的步骤提供可供后续消费的文件。 */
+export function producesFile(step: SyncStep): boolean {
+  return isStoreStep(step) || (step.type === 'SFTP' && step.config.operation === 'READ');
+}
+
+/** 读取步骤使用远端原文件名，其他文件产物使用配置的输出文件名。 */
+export function outputFilename(step: SyncStep): string {
+  if (step.type === 'SSH') return '';
+  if (step.type === 'SFTP' && step.config.operation === 'READ') {
+    return step.config.sourcePath?.split('/').pop() || '';
+  }
+  return step.config.filename;
 }
 
 export function createTask(): SyncTask {
@@ -41,6 +55,14 @@ export function createTask(): SyncTask {
 
 export function createStep(type: StepType, component: HttpComponent = 'GENERIC'): SyncStep {
   const common = { key: stepKey(), name: type === 'HTTP' ? httpComponentLabel(component) : type };
+  if (type === 'SSH') {
+    return {
+      ...common,
+      name: 'Shell 命令执行',
+      type,
+      config: { serverId: null, command: '', timeoutSeconds: 60 },
+    };
+  }
   if (type === 'KEYSTORE' || type === 'TRUSTSTORE') {
     return {
       ...common,
@@ -103,7 +125,7 @@ export function parameterMaps(steps: SyncStep[]): ParameterMaps {
   for (const step of steps) {
     for (const field of parameterFields) {
       maps[step.key + field] = JSON.stringify(
-        isStoreStep(step) ? {} : step.config[field] || {},
+        isStoreStep(step) || step.type === 'SSH' ? {} : step.config[field] || {},
         null,
         2,
       );
@@ -117,6 +139,7 @@ export function taskPayload(task: SyncTask, maps: ParameterMaps): SyncTask {
   for (const step of payload.steps) {
     if (
       step.type === 'HTTP' &&
+      !step.config.businessComponent &&
       (!step.config.httpComponent || step.config.httpComponent === 'GENERIC')
     ) {
       for (const field of parameterFields) {
@@ -162,5 +185,12 @@ export function httpComponentLabel(component: HttpComponent = 'GENERIC') {
 }
 
 export function stepLabel(step: SyncStep) {
+  if (step.type === 'SSH') return 'Shell 命令执行';
+  if (step.type === 'HTTP' && step.config.businessComponent)
+    return {
+      IS_TRUSTSTORE: 'IS truststore 更新',
+      IS_KEYSTORE: 'IS keyStore 更新',
+      TN_CERTIFICATE: 'TN 证书更新',
+    }[step.config.businessComponent];
   return step.type === 'HTTP' ? httpComponentLabel(step.config.httpComponent) : step.type;
 }

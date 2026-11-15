@@ -128,6 +128,8 @@ class WorkflowQueries {
       var c = map(step.get("config"));
       c.remove("references");
       c.remove("resolvedEntries");
+      c.remove("resolvedBody");
+      c.remove("resolvedAssetId");
       c.put("passwordConfigured", secret.containsKey("password"));
       c.put("keyPasswordConfigured", secret.containsKey("keyPassword"));
       step.put("config", c);

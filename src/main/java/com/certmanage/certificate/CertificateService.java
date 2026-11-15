@@ -177,7 +177,10 @@ public class CertificateService {
             scope,
             m);
     if (!ids.isEmpty()) {
-      db.update("update certificate_assets set deleted_at=null where id=?", ids.getFirst());
+      // 显式重新导入保留原有恢复语义；未删除的归档资产不能借导入绕过归档。
+      db.update(
+          "update certificate_assets set deleted_at=null,archived_at=null where id=? and deleted_at is not null",
+          ids.getFirst());
       return ids.getFirst();
     }
     Long issuer = index > 0 ? materialId(chain.get(index - 1)) : m;
@@ -230,7 +233,7 @@ public class CertificateService {
   }
 
   /**
-   * @description 在同一事务中复用客户、保存完整链对应资产并记录导入审计
+   * @description 在同一事务中按 DER 指纹复用所有层级节点，统计新增、跳过及恢复数量并记录导入审计
    * @author Freddy
    * @date 2026-11-12
    * @param p 已完成密码学解析与匹配校验的证书链及可选私钥
@@ -238,7 +241,7 @@ public class CertificateService {
    * @param customerName 导入时的所属客户名称，自有证书可不填
    * @param purpose 证书用途 AS2、HTTPS 或 GENERAL
    * @param user 当前操作账号
-   * @return 包含终端资产 ID 的响应
+   * @return 包含终端资产 ID、新增数、跳过数及已删除资产恢复数的响应
    */
   public synchronized Map<String, Object> saveImport(
       CertificateCrypto.Parsed p, String owner, String customerName, String purpose, String user) {
@@ -252,8 +255,19 @@ public class CertificateService {
             customer = customers.findOrCreateForImport(customerName);
           }
           long actor = audit.actor(user), last = 0;
+          int imported = 0, skipped = 0, restored = 0;
+          String scope = owner.equals("OWN") ? "OWN" : "CUSTOMER:" + customer;
           for (int i = 0; i < p.chain().size(); i++) {
             if (owner.equals("CUSTOMER") && i < p.chain().size() - 1) continue;
+            var existing =
+                db.queryForList(
+                    "select deleted_at is not null from certificate_assets where scope_key=? and material_id=?",
+                    Boolean.class,
+                    scope,
+                    materialId(p.chain().get(i)));
+            if (existing.isEmpty()) imported++;
+            else if (existing.getFirst()) restored++;
+            else skipped++;
             last =
                 saveAsset(
                     p.chain(),
@@ -266,7 +280,15 @@ public class CertificateService {
                     actor);
           }
           audit.record(user, "CERTIFICATE_IMPORT", "CERTIFICATE", last);
-          return Map.of("id", last);
+          return Map.of(
+              "id",
+              last,
+              "importedCount",
+              imported,
+              "skippedCount",
+              skipped,
+              "restoredCount",
+              restored);
         });
   }
 
@@ -295,6 +317,7 @@ public class CertificateService {
             db.queryForMap(
                 "select * from certificate_assets where deleted_at is null and id=?", id);
         require("OWN".equals(row.get("OWNER_TYPE")), "必须选择自有CA");
+        require(Boolean.TRUE.equals(row.get("ENABLED")), "签发者证书已禁用");
         require(
             (k.equals("LEAF") ? "INTERMEDIATE" : "ROOT").equals(row.get("CERTIFICATE_KIND")),
             "上级证书层级不正确");
@@ -316,6 +339,9 @@ public class CertificateService {
       chain.add(pair.cert());
       return tx.execute(
           s -> {
+            // 与禁用操作共用锁，防止签名计算期间被禁用的CA仍提交新资产。
+            db.queryForObject("select id from sync_guard where id=1 for update", Integer.class);
+            if (!k.equals("ROOT")) requireEnabled(((Number) b.get("issuerId")).longValue());
             long id =
                 saveAsset(
                     chain,
@@ -337,7 +363,7 @@ public class CertificateService {
   }
 
   private static final String SELECT =
-      "select a.*,m.common_name,m.subject_dn,m.issuer_dn,m.serial_hex,m.not_before,m.not_after,m.fingerprint_sha256,m.public_key_algorithm,m.signature_algorithm,m.san_json,c.customer_name,im.common_name issuer_name,exists(select 1 from private_keys p where p.own_asset_id=a.id) has_key from certificate_assets a join certificate_materials m on m.id=a.material_id left join customers c on c.id=a.customer_id left join certificate_materials im on im.id=a.issuer_material_id ";
+      "select a.*,m.common_name,m.subject_dn,m.issuer_dn,m.serial_hex,m.not_before,m.not_after,m.fingerprint_sha256,m.public_key_algorithm,m.signature_algorithm,m.san_json,c.customer_name,im.common_name issuer_name,not exists(select 1 from asset_chain_nodes cn join certificate_materials cm on cm.id=cn.material_id where cn.asset_id=a.id and (cm.not_before>current_timestamp or cm.not_after<=current_timestamp)) chain_available,exists(select 1 from private_keys p where p.own_asset_id=a.id) has_key from certificate_assets a join certificate_materials m on m.id=a.material_id left join customers c on c.id=a.customer_id left join certificate_materials im on im.id=a.issuer_material_id ";
 
   /**
    * @description 将证书查询行转换为现有 HTTP 字段并计算当前有效状态
@@ -353,7 +379,12 @@ public class CertificateService {
     m.put("id", r.getLong("id"));
     m.put("name", r.getString("common_name"));
     m.put("owner", r.getString("owner_type"));
+    m.put("enabled", r.getBoolean("enabled"));
+    OffsetDateTime archivedAt = r.getObject("archived_at", OffsetDateTime.class);
+    m.put("archivedAt", archivedAt == null ? null : archivedAt.toInstant().toString());
     m.put("customer", r.getString("customer_name"));
+    m.put("customerId", r.getObject("customer_id", Long.class));
+    m.put("chainAvailable", r.getBoolean("chain_available"));
     m.put("purpose", r.getString("purpose"));
     m.put("kind", r.getString("certificate_kind"));
     m.put("depth", r.getObject("chain_depth"));
@@ -393,9 +424,74 @@ public class CertificateService {
   public List<Map<String, Object>> list(String owner) {
     require(Set.of("OWN", "CUSTOMER").contains(owner), "归属错误");
     return db.query(
-        SELECT + "where a.deleted_at is null and a.owner_type=? order by m.not_after,a.id",
+        SELECT
+            + "where a.deleted_at is null and a.archived_at is null and a.owner_type=? order by m.not_after,a.id",
         this::dto,
         owner);
+  }
+
+  /**
+   * @description 查询未删除的归档证书，可按归属筛选
+   * @author Freddy
+   * @date 2026-11-12
+   * @param owner 可为空的归属类型 OWN 或 CUSTOMER
+   * @return 按归档时间倒序排列的证书列表
+   * @throws IllegalArgumentException 归属类型不合法时抛出
+   */
+  public List<Map<String, Object>> archived(String owner) {
+    require(owner == null || Set.of("OWN", "CUSTOMER").contains(owner), "归属错误");
+    String sql = SELECT + "where a.deleted_at is null and a.archived_at is not null";
+    if (owner == null) return db.query(sql + " order by a.archived_at desc,a.id", this::dto);
+    return db.query(sql + " and a.owner_type=? order by a.archived_at desc,a.id", this::dto, owner);
+  }
+
+  /**
+   * @description 在同步事务锁下归档资产，保留原启用状态与全部引用
+   * @author Freddy
+   * @date 2026-11-12
+   * @param id 证书资产 ID
+   * @param actor 当前操作账号
+   * @throws IllegalArgumentException 证书不存在时抛出
+   */
+  public void archive(long id, String actor) {
+    changeArchive(id, true, actor);
+  }
+
+  /**
+   * @description 恢复归档资产，继续使用归档前的启用状态
+   * @author Freddy
+   * @date 2026-11-12
+   * @param id 证书资产 ID
+   * @param actor 当前操作账号
+   * @throws IllegalArgumentException 证书不存在时抛出
+   */
+  public void restore(long id, String actor) {
+    changeArchive(id, false, actor);
+  }
+
+  /**
+   * @description 共用同步事务锁切换归档状态并记录审计，重复请求保持状态
+   * @author Freddy
+   * @date 2026-11-12
+   * @param id 证书资产 ID
+   * @param archived 是否归档
+   * @param actor 当前操作账号
+   * @throws IllegalArgumentException 证书不存在时抛出
+   */
+  private void changeArchive(long id, boolean archived, String actor) {
+    tx.executeWithoutResult(
+        status -> {
+          db.queryForObject("select id from sync_guard where id=1 for update", Integer.class);
+          var asset = detail(id);
+          if ((asset.get("archivedAt") != null) == archived) return;
+          db.update(
+              "update certificate_assets set archived_at="
+                  + (archived ? "current_timestamp" : "null")
+                  + ",updated_at=current_timestamp where id=? and deleted_at is null",
+              id);
+          audit.record(
+              actor, archived ? "CERTIFICATE_ARCHIVE" : "CERTIFICATE_RESTORE", "CERTIFICATE", id);
+        });
   }
 
   /**
@@ -412,6 +508,51 @@ public class CertificateService {
   }
 
   /**
+   * @description 校验证书资产仍然启用，管理查询和导出不受此业务使用约束影响
+   * @author Freddy
+   * @date 2026-11-12
+   * @param id 证书资产 ID
+   * @return 已启用资产详情
+   * @throws IllegalArgumentException 证书不存在或已禁用时抛出
+   */
+  public Map<String, Object> requireEnabled(long id) {
+    var asset = detail(id);
+    require(asset.get("archivedAt") == null, "证书已归档，不能用于业务操作");
+    require(Boolean.TRUE.equals(asset.get("enabled")), "证书已禁用，不能用于业务操作");
+    return asset;
+  }
+
+  /**
+   * @description 在同步全局锁及事务内修改证书使用状态，并保留操作审计
+   * @author Freddy
+   * @date 2026-11-12
+   * @param id 待修改的证书资产 ID
+   * @param enabled true 表示启用，false 表示禁用
+   * @param actor 当前已认证操作账号
+   * @throws IllegalArgumentException 证书不存在或已删除时抛出
+   */
+  public void setEnabled(long id, boolean enabled, String actor) {
+    tx.executeWithoutResult(
+        status -> {
+          db.queryForObject("select id from sync_guard where id=1 for update", Integer.class);
+          require(
+              db.update(
+                      "update certificate_assets set enabled=?,updated_at=current_timestamp where id=? and deleted_at is null and archived_at is null",
+                      enabled,
+                      id)
+                  == 1,
+              "证书不存在或已归档");
+          audit.record(
+              actor,
+              enabled ? "CERTIFICATE_ENABLE" : "CERTIFICATE_DISABLE",
+              "CERTIFICATE",
+              id,
+              "SUCCESS",
+              enabled ? "启用证书" : "禁用证书");
+        });
+  }
+
+  /**
    * @description 按根到终端顺序查询证书链节点及展示字段
    * @author Freddy
    * @date 2026-11-12
@@ -424,6 +565,7 @@ public class CertificateService {
         (r, n) -> {
           var m = new LinkedHashMap<String, Object>();
           m.put("name", r.getString("common_name"));
+          m.put("materialId", r.getLong("id"));
           m.put("depth", r.getInt("node_position"));
           m.put(
               "kind",
@@ -464,29 +606,31 @@ public class CertificateService {
   }
 
   /**
-   * @description 在同步锁和事务保护下校验证书引用，逻辑删除自有资产
+   * @description 在同步锁和事务保护下校验证书引用，逻辑删除已归档的自有或客户资产
    * @author Freddy
    * @date 2026-11-12
    * @param id 证书资产 ID
    * @param user 当前操作账号
    */
-  public synchronized void deleteOwn(long id, String user) {
+  public synchronized void deleteArchived(long id, String user) {
     tx.executeWithoutResult(
         status -> {
           db.queryForObject("select id from sync_guard where id=1 for update", Integer.class);
           var asset = detail(id);
-          require("OWN".equals(asset.get("owner")), "仅支持删除自有证书");
+          require(asset.get("archivedAt") != null, "请先归档证书再删除");
           long material =
               db.queryForObject(
                   "select material_id from certificate_assets where id=?", Long.class, id);
-          protectSyncReferences(id, material);
+          // 客户资产仅删除自身，共享公钥材料仍保留，不能反向阻止自有资产或其他客户。
+          Long referencedMaterial = "OWN".equals(asset.get("owner")) ? material : null;
+          protectSyncReferences(id, referencedMaterial);
           var refs =
               db.queryForList(
                   "select distinct a.id,m.common_name from certificate_assets a join certificate_materials m on m.id=a.material_id where a.deleted_at is null and a.id<>? and (a.issuer_asset_id=? or a.issuer_material_id=? or exists(select 1 from asset_chain_nodes n where n.asset_id=a.id and n.material_id=?)) order by a.id",
                   id,
                   id,
-                  material,
-                  material);
+                  referencedMaterial,
+                  referencedMaterial);
           require(
               refs.isEmpty(),
               "证书被以下证书引用，无法删除："
@@ -511,9 +655,9 @@ public class CertificateService {
    * @author Freddy
    * @date 2026-11-12
    * @param asset 证书资产 ID
-   * @param material 证书公钥材料 ID
+   * @param material 自有资产的公钥材料 ID；客户资产为 null，仅保护资产本身
    */
-  private void protectSyncReferences(long asset, long material) {
+  private void protectSyncReferences(long asset, Long material) {
     var tasks =
         db.queryForList(
             "select distinct t.name from sync_step_certificates c join sync_task_steps st on st.id=c.step_id join sync_tasks t on t.id=st.task_id where t.deleted_at is null and (c.source_asset_id=? or c.material_id=?)",
@@ -550,7 +694,8 @@ public class CertificateService {
     return list("OWN").stream()
         .filter(
             r ->
-                kind.equals(r.get("kind"))
+                Boolean.TRUE.equals(r.get("enabled"))
+                    && kind.equals(r.get("kind"))
                     && Boolean.TRUE.equals(r.get("hasKey"))
                     && Set.of("有效", "即将过期").contains(r.get("status")))
         .toList();

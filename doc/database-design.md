@@ -1,5 +1,24 @@
 # 数据库表设计
 
+> 当前口径（2026-11-14）：实际迁移为 V1–V10，共 36 张业务/辅助表，不含 Flyway 自身表。V10 是 `src/main/java/db/migration/V10__ssh_shell_steps.java`，调整 SSH 类型约束而不新增表。下文 V1/V4/V5 表数量和字段说明保留对应阶段背景；`app_sessions`、`scheduler_state` 目前预留。完整核对见[需求与设计核对基线](requirements-design-review-2026-11-14.md)。
+
+## 当前迁移索引
+
+| 版本 | 变化 | 新增表数 |
+| --- | --- | --- |
+| V1 | 基础账号、客户、证书、SMTP、通知、操作审计等；下文字典描述此阶段 | 19 |
+| V2 | `certificate_assets.deleted_at`，逻辑删除 | 0 |
+| V3 | 秘密集合、服务器、连接版本及信任材料引用 | 4 |
+| V4 | 流程、步骤、引用、执行快照、步骤结果及互斥锁 | 11 |
+| V5 | 统一摘要 `execution_logs` | 1 |
+| V6 | 客户 `external_id`、`id_type` | 0 |
+| V7 | 证书 `enabled` | 0 |
+| V8 | 证书 `archived_at` | 0 |
+| V9 | 原始审计 `execution_log_raw` 及摘要的 `raw_trace_id` 关联 | 1 |
+| V10 | Java 迁移，扩展服务器协议及步骤类型白名单以接受 SSH | 0 |
+
+当前以 `src/main/resources/db/migration` 的 V1–V9 SQL 与 `src/main/java/db/migration` 的 V10 Java 迁移为执行来源。`doc/sql` 为 SQL 文档副本；不要因没有 V10 SQL 副本而补建重复迁移。以下是历史阶段设计与基础字段字典。
+
 > V5新增统一日志表 `execution_logs`，核心列 `actor_name`（执行人）、`occurred_at`（执行时间）、`message`（内容描述）；额外来源、结果及关联ID仅用于筛选与追踪。旧操作审计及已有执行结果快照迁入，后续所有操作/执行事件汇总至此表。脚本为 `sql/V5__execution_audit_logs.sql`，不提供更新删除API；原 `audit_events` 作为兼容记录保留。当前总计35张业务/辅助表。
 
 > 2026-11-09扩展：服务器和同步流程的数据表提案见 `server-sync-design.md` 第8节，待设计确认后实施新迁移；本文件下列基础表为已有MVP模型。

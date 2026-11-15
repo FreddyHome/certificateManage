@@ -20,6 +20,7 @@ const {
   maps,
   edit,
   add,
+  addBusiness,
   move,
   duplicate,
   save,
@@ -76,6 +77,7 @@ function viewAudit(id: number) {
     @save="run(save)"
     @validate="validate"
     @add="add"
+    @add-business="addBusiness"
     @move="move"
     @duplicate="duplicate"
   />

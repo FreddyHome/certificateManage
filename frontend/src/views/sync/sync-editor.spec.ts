@@ -7,9 +7,63 @@ import {
   taskPayload,
   parameterMaps,
   stepLabel,
+  producesFile,
+  outputFilename,
 } from './sync-editor';
 
 describe('同步编辑规则', () => {
+  it('Shell 步骤仅保存固定参数，复制隔离且不提供文件输出', () => {
+    const shell = createStep('SSH');
+    expect(shell.config).toEqual({ serverId: null, command: '', timeoutSeconds: 60 });
+    expect(stepLabel(shell)).toBe('Shell 命令执行');
+    if (shell.type !== 'SSH') throw new Error();
+    shell.config.serverId = 12;
+    shell.config.command = 'echo fixed\nexit 0';
+    const copy = duplicateStep(shell);
+    const payload = taskPayload(
+      { ...createTask(), steps: [shell, copy] },
+      parameterMaps([shell, copy]),
+    );
+    shell.config.command = 'changed';
+    expect(payload.steps[0].config).toEqual({
+      serverId: 12,
+      command: 'echo fixed\nexit 0',
+      timeoutSeconds: 60,
+    });
+    expect(copy.key).not.toBe(shell.key);
+    expect(copy.config).toMatchObject({ command: 'echo fixed\nexit 0' });
+    expect(producesFile(copy)).toBe(false);
+    expect(outputFilename(copy)).toBe('');
+  });
+  it('仅制作及 SFTP 读取步骤产生文件，读取保留远端原文件名', () => {
+    const read = createStep('SFTP');
+    if (read.type !== 'SFTP') throw new Error();
+    read.config.operation = 'READ';
+    read.config.sourcePath = '/opt/certs/server.p12';
+    expect(producesFile(read)).toBe(true);
+    expect(outputFilename(read)).toBe('server.p12');
+    expect(producesFile(createStep('KEYSTORE'))).toBe(true);
+    expect(producesFile(createStep('TRUSTSTORE'))).toBe(true);
+    expect(producesFile(createStep('HTTP'))).toBe(false);
+    expect(producesFile(createStep('SFTP'))).toBe(false);
+    const move = duplicateStep(read);
+    if (move.type !== 'SFTP') throw new Error();
+    move.config.operation = 'MOVE';
+    expect(producesFile(move)).toBe(false);
+    const http = createStep('HTTP');
+    if (http.type !== 'HTTP') throw new Error();
+    http.config.sourceStep = read.key;
+    http.config.filename = outputFilename(read);
+    const saved = taskPayload(
+      { ...createTask(), steps: [read, http] },
+      parameterMaps([read, http]),
+    );
+    expect(saved.steps[0].config).toMatchObject({
+      operation: 'READ',
+      sourcePath: '/opt/certs/server.p12',
+    });
+    expect(saved.steps[1].config).toMatchObject({ sourceStep: read.key, filename: 'server.p12' });
+  });
   it('固定 HTTP 组件保存和复制保留业务选择，不读取通用请求参数', () => {
     const reload = createStep('HTTP', 'RELOAD_KEYSTORE');
     const partner = createStep('HTTP', 'UPDATE_TN_PARTNER');

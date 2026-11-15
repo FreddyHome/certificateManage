@@ -232,14 +232,29 @@ class FixedComponentsWorkflowTest {
       String messages = logs.list("SYNC", run, null, null, null, 1, 100).toString();
       assertTrue(messages.contains("reload-message-marker"));
       assertTrue(messages.contains("partner-success-marker"));
+      certs.setEnabled(selected, false, "admin");
       failing.set(true);
       long failed = workflows.enqueue(task, UUID.randomUUID().toString(), "admin");
       runner.executeRun(failed);
       assertEquals("FAILED", workflows.runDetail(failed).get("status"));
+      var fallbackPayload = json.readTree(requestBody.get());
+      assertArrayEquals(
+          oldLeaf.cert().getEncoded(),
+          Base64.getDecoder()
+              .decode(fallbackPayload.path("certChain").get(2).path("certificateBase64").asText()));
       assertTrue(
           logs.list("SYNC", failed, null, null, null, 1, 100)
               .toString()
               .contains("partner-failure-marker"));
+      certs.setEnabled(selected, true, "admin");
+      certs.archive(selected, "admin");
+      long archivedRun = workflows.enqueue(task, UUID.randomUUID().toString(), "admin");
+      runner.executeRun(archivedRun);
+      var archivedPayload = json.readTree(requestBody.get());
+      assertArrayEquals(
+          oldLeaf.cert().getEncoded(),
+          Base64.getDecoder()
+              .decode(archivedPayload.path("certChain").get(2).path("certificateBase64").asText()));
       assertEquals(1, afterCalls.get());
     } finally {
       http.stop(0);

@@ -22,6 +22,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  */
 public class WorkflowRunner {
   private final JdbcTemplate db;
+  private final BusinessComponents business;
+  private final com.certmanage.common.RawExecutionLog raw;
   private final TransactionTemplate tx;
   private final WorkflowService workflows;
   private final StoreMaker stores;
@@ -47,6 +49,8 @@ public class WorkflowRunner {
    * @param transport 操作所需的配置或依赖
    * @param servers 操作所需的配置或依赖
    * @param logs 操作所需的配置或依赖
+   * @param business 固定业务组件执行服务
+   * @param raw 加密原始日志服务
    */
   public WorkflowRunner(
       JdbcTemplate db,
@@ -58,7 +62,11 @@ public class WorkflowRunner {
       CertificateCrypto crypto,
       RemoteTransport transport,
       ServerService servers,
-      com.certmanage.common.ExecutionLog logs) {
+      com.certmanage.common.ExecutionLog logs,
+      BusinessComponents business,
+      com.certmanage.common.RawExecutionLog raw) {
+    this.raw = raw;
+    this.business = business;
     this.db = db;
     this.tx = tx;
     this.workflows = workflows;
@@ -85,7 +93,7 @@ public class WorkflowRunner {
   }
 
   /**
-   * @description 领取并执行指定运行快照，记录固定业务响应消息
+   * @description 执行冻结快照，将制作和 SFTP 读取产物供后续步骤复用，仅记录文件元数据
    * @author Freddy
    * @date 2026-11-12
    * @param id 记录标识
@@ -110,6 +118,7 @@ public class WorkflowRunner {
     String actor = "system";
     var files = new HashMap<String, Artifact>();
     long totalBytes = 0;
+    var rawScope = raw.begin();
     try {
       var snapshot =
           workflows.decode(
@@ -130,15 +139,19 @@ public class WorkflowRunner {
           Map.of());
       for (var step : maps(snapshot.get("steps"))) {
         current = str(step, "key", "");
+        com.certmanage.common.RawExecutionLog.step(current);
         String type = str(step, "type", "");
         currentDescription =
             (switch (type) {
                   case "KEYSTORE" -> "制作Keystore";
                   case "TRUSTSTORE" -> "制作Truststore";
+                  case "SSH" -> "Shell命令执行";
                   case "SFTP" ->
-                      "MOVE".equals(map(step.get("config")).get("operation"))
-                          ? "SFTP移动/重命名"
-                          : "SFTP上传";
+                      switch (str(map(step.get("config")), "operation", "UPLOAD")) {
+                        case "MOVE" -> "SFTP移动/重命名";
+                        case "READ" -> "SFTP读取";
+                        default -> "SFTP上传";
+                      };
                   default -> "HTTP接口调用";
                 })
                 + "步骤“"
@@ -161,12 +174,61 @@ public class WorkflowRunner {
             currentDescription + "开始",
             Map.of());
         heartbeat();
+        // 同时校验输入证书与服务器信任证书，已排队任务不绕过后续的禁用操作。
+        for (long referencedAsset :
+            db.queryForList(
+                "select distinct source_asset_id from sync_run_certificates where run_id=?",
+                Long.class,
+                id)) {
+          certs.requireEnabled(referencedAsset);
+        }
+
         for (var ref : maps(c.get("references"))) {
-          certs.detail(id(ref, "assetId"));
+          certs.requireEnabled(id(ref, "assetId"));
           certs.material(id(ref, "materialId")).checkValidity();
         }
         Map<String, Object> result;
-        if (type.equals("KEYSTORE") || type.equals("TRUSTSTORE")) {
+        if (type.equals("SSH")) {
+          var server = map(step.get("serverSnapshot"));
+          long serverId = id(server, "id");
+          require(servers.enabled(serverId), "目标服务器已停用");
+          logs.append(
+              "SYNC",
+              "SSH_STARTED",
+              "STARTED",
+              actor,
+              id,
+              current,
+              "SERVER",
+              serverId,
+              "开始在服务器“" + server.get("alias") + "”执行Shell命令",
+              Map.of("serverAlias", server.get("alias")));
+          result = transport.execute(serverId, id(server, "configId"), c, null, null);
+        } else if (BusinessComponents.matches(c)) {
+          String stepKey = current;
+          String runActor = actor;
+          result =
+              business.execute(
+                  step,
+                  25 * 1024 * 1024 - totalBytes,
+                  message -> {
+                    heartbeat();
+                    logs.append(
+                        "SYNC",
+                        "COMPONENT_PHASE",
+                        message.contains("失败")
+                            ? "FAILURE"
+                            : message.contains("成功") ? "SUCCESS" : "STARTED",
+                        runActor,
+                        id,
+                        stepKey,
+                        "SYNC_RUN",
+                        id,
+                        message,
+                        Map.of());
+                  });
+          totalBytes += ((Number) result.getOrDefault("artifactBytes", 0)).longValue();
+        } else if (type.equals("KEYSTORE") || type.equals("TRUSTSTORE")) {
           Long secretId =
               step.get("secretId") == null ? null : ((Number) step.get("secretId")).longValue();
           byte[] data = stores.make(type, c, secrets.read(secretId));
@@ -187,6 +249,7 @@ public class WorkflowRunner {
           long serverId = id(server, "id");
           require(servers.enabled(serverId), "目标服务器已停用");
           var input = files.get(str(c, "sourceStep", ""));
+          require(str(c, "sourceStep", "").isBlank() || input != null, "来源步骤未生成文件");
           if (c.get("certificateId") != null)
             input =
                 new Artifact(
@@ -203,22 +266,40 @@ public class WorkflowRunner {
               current,
               "SERVER",
               serverId,
-              "MOVE".equals(c.get("operation"))
-                  ? "服务器“"
-                      + server.get("alias")
-                      + "”移动文件："
-                      + c.get("sourcePath")
-                      + " -> "
-                      + c.get("targetPath")
-                  : "开始向服务器“" + server.get("alias") + "”传输文件“" + filename + "”",
+              "READ".equals(c.get("operation"))
+                  ? "开始从服务器“" + server.get("alias") + "”读取文件：" + c.get("sourcePath")
+                  : "MOVE".equals(c.get("operation"))
+                      ? "服务器“"
+                          + server.get("alias")
+                          + "”移动文件："
+                          + c.get("sourcePath")
+                          + " -> "
+                          + c.get("targetPath")
+                      : "开始向服务器“" + server.get("alias") + "”传输文件“" + filename + "”",
               Map.of("serverAlias", server.get("alias"), "filename", filename));
-          result =
-              transport.execute(
-                  serverId,
-                  id(server, "configId"),
-                  c,
-                  input == null ? null : input.bytes(),
-                  filename);
+          if (type.equals("SFTP") && "READ".equals(c.get("operation"))) {
+            int allowance = (int) Math.min(10 * 1024 * 1024, 25 * 1024 * 1024 - totalBytes);
+            var file = transport.readFile(serverId, id(server, "configId"), c, allowance);
+            files.put(current, new Artifact(file.bytes(), file.filename()));
+            totalBytes += file.bytes().length;
+            result =
+                Map.of(
+                    "filename",
+                    file.filename(),
+                    "bytes",
+                    file.bytes().length,
+                    "sourcePath",
+                    file.sourcePath(),
+                    "message",
+                    "SFTP读取成功：" + file.sourcePath());
+          } else
+            result =
+                transport.execute(
+                    serverId,
+                    id(server, "configId"),
+                    c,
+                    input == null ? null : input.bytes(),
+                    filename);
         }
         db.update(
             "update sync_run_steps set status='SUCCESS',finished_at=current_timestamp,result_json=? where run_id=? and step_key=?",
@@ -256,6 +337,7 @@ public class WorkflowRunner {
           "同步任务“" + taskName + "”执行成功",
           Map.of());
     } catch (Exception failure) {
+      com.certmanage.common.RawExecutionLog.exception(failure);
       String error =
           currentDescription
               + (failure instanceof com.certmanage.server.RemoteFailure remote
@@ -319,17 +401,21 @@ public class WorkflowRunner {
     } finally {
       files.values().forEach(a -> Arrays.fill(a.bytes(), (byte) 0));
       active.remove(id);
-      logs.append(
-          "SYNC",
-          "ARTIFACTS_RELEASED",
-          "INFO",
-          actor,
-          id,
-          null,
-          "SYNC_RUN",
-          id,
-          "执行产物内存已释放",
-          Map.of("count", files.size(), "bytes", totalBytes));
+      try {
+        logs.append(
+            "SYNC",
+            "ARTIFACTS_RELEASED",
+            "INFO",
+            actor,
+            id,
+            null,
+            "SYNC_RUN",
+            id,
+            "执行产物内存已释放",
+            Map.of("count", files.size(), "bytes", totalBytes));
+      } finally {
+        rawScope.close();
+      }
     }
   }
 

@@ -57,6 +57,45 @@ public class CertificateController {
   }
 
   /**
+   * @description 按可选归属查询归档证书
+   * @author Freddy
+   * @date 2026-11-12
+   * @param owner 可为空的归属类型
+   * @return 归档证书列表
+   * @throws IllegalArgumentException 归属不合法时抛出
+   */
+  @GetMapping("/certificates/archived")
+  public Object archived(@RequestParam(required = false) String owner) {
+    return service.archived(owner);
+  }
+
+  /**
+   * @description 归档证书并保留原启用状态
+   * @author Freddy
+   * @date 2026-11-12
+   * @param id 证书资产 ID
+   * @param principal 当前操作账号
+   * @throws IllegalArgumentException 证书不存在时抛出
+   */
+  @PostMapping("/certificates/{id}/archive")
+  public void archive(@PathVariable long id, Principal principal) {
+    service.archive(id, principal.getName());
+  }
+
+  /**
+   * @description 恢复归档证书及其原启用状态
+   * @author Freddy
+   * @date 2026-11-12
+   * @param id 证书资产 ID
+   * @param principal 当前操作账号
+   * @throws IllegalArgumentException 证书不存在时抛出
+   */
+  @PostMapping("/certificates/{id}/restore")
+  public void restore(@PathVariable long id, Principal principal) {
+    service.restore(id, principal.getName());
+  }
+
+  /**
    * @description 读取指定证书的展示详情
    * @author Freddy
    * @date 2026-11-12
@@ -69,7 +108,7 @@ public class CertificateController {
   }
 
   /**
-   * @description 请求删除自有证书，并传递当前操作人
+   * @description 请求删除已归档的自有或客户证书，并传递当前操作人
    * @author Freddy
    * @date 2026-11-12
    * @param id 证书资产 ID
@@ -77,7 +116,31 @@ public class CertificateController {
    */
   @DeleteMapping("/certificates/{id}")
   public void delete(@PathVariable long id, Principal p) {
-    service.deleteOwn(id, p.getName());
+    service.deleteArchived(id, p.getName());
+  }
+
+  /**
+   * @description 证书状态写入请求，启用字段必须显式提供
+   * @author Freddy
+   * @date 2026-11-12
+   * @param enabled 是否启用；null 为非法请求
+   */
+  public record EnabledRequest(Boolean enabled) {}
+
+  /**
+   * @description 修改自有或客户证书的业务启用状态
+   * @author Freddy
+   * @date 2026-11-12
+   * @param id 证书资产 ID
+   * @param input 启用状态请求
+   * @param principal 当前已认证操作账号
+   * @throws IllegalArgumentException 字段缺失或证书不存在时抛出
+   */
+  @PatchMapping("/certificates/{id}/enabled")
+  public void setEnabled(
+      @PathVariable long id, @RequestBody EnabledRequest input, Principal principal) {
+    require(input.enabled() != null, "请明确指定启用状态");
+    service.setEnabled(id, input.enabled(), principal.getName());
   }
 
   /**

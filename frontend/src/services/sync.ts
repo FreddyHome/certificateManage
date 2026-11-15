@@ -36,8 +36,12 @@ export async function loadSyncOptions() {
     listCustomers(),
   ]);
   const certificates: SyncCertificate[] = [
-    ...own.map((certificate) => ({ ...certificate, owner: 'OWN' as const })),
-    ...customer.map((certificate) => ({ ...certificate, owner: 'CUSTOMER' as const })),
+    ...own
+      .filter((certificate) => certificate.enabled !== false)
+      .map((certificate) => ({ ...certificate, owner: 'OWN' as const })),
+    ...customer
+      .filter((certificate) => certificate.enabled !== false)
+      .map((certificate) => ({ ...certificate, owner: 'CUSTOMER' as const })),
   ];
   return { servers, certificates, customers };
 }

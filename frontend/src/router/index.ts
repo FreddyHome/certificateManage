@@ -19,6 +19,10 @@ const router = createRouter({
           component: () => import('../views/certificates/CertificateView.vue'),
           props: { owner: 'CUSTOMER' },
         },
+        {
+          path: 'certificates/archived',
+          component: () => import('../views/certificates/ArchivedCertificateView.vue'),
+        },
         { path: 'servers', component: () => import('../views/servers/ServerView.vue') },
         { path: 'sync', component: () => import('../views/sync/SyncView.vue') },
         { path: 'customers', component: () => import('../views/customers/CustomerView.vue') },

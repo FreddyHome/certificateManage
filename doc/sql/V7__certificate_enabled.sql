@@ -1,0 +1,1 @@
+ALTER TABLE certificate_assets ADD COLUMN enabled BOOLEAN DEFAULT TRUE NOT NULL;

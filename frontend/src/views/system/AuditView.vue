@@ -4,6 +4,8 @@ import { useRoute } from 'vue-router';
 import { request } from '../../api/client';
 import { run } from '../../composables/useAsyncAction';
 import { date } from '../../utils/format';
+import AuditLogDetail from './AuditLogDetail.vue';
+const detailId = ref<number | null>(null);
 const route = useRoute(),
   source = ref(''),
   outcome = ref(''),
@@ -72,7 +74,9 @@ onMounted(() => run(load));
   <div class="page-heading">
     <div>
       <h1>审计日志</h1>
-      <p class="sub">执行事件持久化保存，包含成功、失败、跳过及中断；凭据与报文内容不记录。</p>
+      <p class="sub">
+        执行事件持久化保存；查看详情可读取加密保存的原始请求、响应、SFTP操作及异常堆栈。
+      </p>
     </div>
   </div>
   <div class="panel toolbar" style="flex-wrap: wrap">
@@ -134,7 +138,12 @@ onMounted(() => run(load));
         prop="message"
         label="操作 / 执行内容"
         min-width="300"
-        show-overflow-tooltip /></el-table
+        show-overflow-tooltip
+      /><el-table-column label="操作" width="110" fixed="right"
+        ><template #default="{ row }"
+          ><el-button link type="primary" @click="detailId = row.id">查看详情</el-button></template
+        ></el-table-column
+      ></el-table
     ><el-pagination
       class="pagination"
       v-model:current-page="page"
@@ -144,4 +153,5 @@ onMounted(() => run(load));
       @current-change="run(load)"
     />
   </div>
+  <AuditLogDetail v-if="detailId" :key="detailId" :id="detailId" @close="detailId = null" />
 </template>

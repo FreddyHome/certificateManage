@@ -1,5 +1,7 @@
 # 固定 HTTP 同步组件
 
+> 兼容范围说明：本文为旧固定 HTTP 任务契约，保留兼容。当前新建 IS/TN 业务组件使用 `rest-api.md` 记录的 `/restv2/wm.certificate:cert/...` 接口，不能将旧 URL 和成功判定套用到新组件。见[需求与设计核对基线](requirements-design-review-2026-11-14.md)。
+
 日期：2026-11-12。依据：用户指定的两个 webMethods 接口及本轮确认的 GET、证书选择规则。
 
 ## 设计与兼容

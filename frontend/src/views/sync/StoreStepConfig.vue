@@ -40,7 +40,15 @@ function addEntry() {
         :label="label(c)"
       />
     </el-select>
-    <el-input v-model="e.alias" placeholder="条目别名" style="width: 150px" />
+    <el-input
+      v-if="s.type === 'KEYSTORE'"
+      v-model="e.alias"
+      placeholder="条目别名"
+      style="width: 150px"
+    />
+    <span v-else style="margin: 0 8px; color: var(--el-text-color-secondary)">
+      {{ e.alias ? `已有别名：${e.alias}` : '别名自动生成（CN + SHA-256 指纹）' }}
+    </span>
     <el-checkbox v-model="e.includeChain">包含证书链</el-checkbox>
     <el-button text @click="s.config.entries.splice(j, 1)">移除</el-button>
   </div>

@@ -20,6 +20,7 @@ import org.springframework.stereotype.Component;
  */
 public class WorkflowValidator {
   private final FixedHttpComponents fixed;
+  private final BusinessComponents business;
   private final JdbcTemplate db;
   private final CertificateService certs;
   private final ServerService servers;
@@ -34,13 +35,16 @@ public class WorkflowValidator {
    * @param servers 操作所需的配置或依赖
    * @param secrets 操作所需的配置或依赖
    * @param fixed 操作所需的配置或依赖
+   * @param business 固定业务组件校验服务
    */
   public WorkflowValidator(
       JdbcTemplate db,
       CertificateService certs,
       ServerService servers,
       ConfigSecrets secrets,
-      FixedHttpComponents fixed) {
+      FixedHttpComponents fixed,
+      BusinessComponents business) {
+    this.business = business;
     this.fixed = fixed;
     this.db = db;
     this.certs = certs;
@@ -73,7 +77,7 @@ public class WorkflowValidator {
   }
 
   /**
-   * @description 校验步骤配置并解析执行引用
+   * @description 校验步骤配置并解析执行引用，信任条目未指定别名时按各层证书信息自动生成
    * @author Freddy
    * @date 2026-11-12
    * @param steps 操作所需的配置或依赖
@@ -82,14 +86,14 @@ public class WorkflowValidator {
   public void prepare(List<Map<String, Object>> steps, boolean strict) {
     require(steps.size() <= 30, "最多30个流程步骤");
     if (strict) require(!steps.isEmpty(), "流程至少包含一个步骤");
-    var earlier = new HashSet<String>();
+    var earlier = new HashMap<String, String>();
     var all = new HashSet<String>();
     boolean transfer = false;
     for (var step : steps) {
       String key = str(step, "key", "");
       require(key.matches("[A-Za-z0-9_-]{1,100}") && all.add(key), "步骤标识重复或不合法");
       String type = str(step, "type", "");
-      require(Set.of("KEYSTORE", "TRUSTSTORE", "SFTP", "HTTP").contains(type), "组件类型错误");
+      require(Set.of("KEYSTORE", "TRUSTSTORE", "SFTP", "HTTP", "SSH").contains(type), "组件类型错误");
       String name = str(step, "name", type).trim();
       require(!name.isEmpty() && name.length() <= 200, "步骤名称长度1-200");
       step.put("name", name);
@@ -99,6 +103,37 @@ public class WorkflowValidator {
       c.remove("references");
       var refs = new ArrayList<Map<String, Object>>();
       c.put("references", refs);
+      if (type.equals("SSH")) {
+        require(
+            str(c, "sourceStep", "").isBlank() && c.get("certificateId") == null, "Shell步骤不接受文件输入");
+        require(!BusinessComponents.matches(c), "Shell步骤不支持HTTP业务组件");
+        String command = str(c, "command", "");
+        require(command.length() <= 100000 && !command.contains("\0"), "Shell命令不能超过100000字符或包含空字符");
+        if (strict) require(!command.isBlank(), "请填写Shell命令");
+        String timeout = Objects.toString(c.get("timeoutSeconds"), "60");
+        require(timeout.matches("[0-9]{1,3}"), "Shell执行超时须为1至300秒整数");
+        int seconds = Integer.parseInt(timeout);
+        require(seconds >= 1 && seconds <= 300, "Shell执行超时须为1至300秒整数");
+        c.put("timeoutSeconds", seconds);
+        if (c.get("serverId") != null) {
+          var server = servers.snapshot(id(c, "serverId"));
+          require("SSH".equals(server.get("type")), "Shell步骤必须选择SSH服务器");
+          if (strict) require(servers.enabled(id(c, "serverId")), "服务器已停用");
+        } else if (strict) throw new IllegalArgumentException("请选择SSH服务器");
+        transfer = true;
+        continue;
+      }
+      if (BusinessComponents.matches(c)) {
+        try {
+          business.prepare(step, strict);
+        } catch (IllegalArgumentException invalid) {
+          throw invalid;
+        } catch (Exception invalid) {
+          throw new IllegalArgumentException("业务组件配置解析失败", invalid);
+        }
+        transfer = true;
+        continue;
+      }
       if (type.equals("KEYSTORE") || type.equals("TRUSTSTORE")) {
         String format = str(c, "format", "PKCS12");
         require(Set.of("JKS", "PKCS12").contains(format), "Store格式必须为JKS或PKCS12");
@@ -123,14 +158,15 @@ public class WorkflowValidator {
         for (var entry : entries) {
           long asset = id(entry, "assetId");
           String alias = str(entry, "alias", "").trim();
+          String role = type.equals("TRUSTSTORE") ? "TRUST" : str(entry, "role", "PRIVATE");
+          boolean automaticAlias = role.equals("TRUST") && alias.isEmpty();
           require(
-              !alias.isEmpty()
+              (automaticAlias || !alias.isEmpty())
                   && alias.length() <= 180
                   && !alias.codePoints().anyMatch(Character::isISOControl),
               "条目别名必填且不超过180字");
-          String role = type.equals("TRUSTSTORE") ? "TRUST" : str(entry, "role", "PRIVATE");
           require(Set.of("PRIVATE", "TRUST").contains(role), "条目类型错误");
-          var detail = certs.detail(asset);
+          var detail = strict ? certs.requireEnabled(asset) : certs.detail(asset);
           var chain = materialNodes(asset);
           long terminal = ((Number) chain.getLast().get("materialId")).longValue();
           if (role.equals("PRIVATE")) {
@@ -151,7 +187,9 @@ public class WorkflowValidator {
               long material = ((Number) node.get("materialId")).longValue();
               if (!trustMaterials.add(material)) continue;
               String nodeAlias =
-                  material == terminal ? alias : alias + "-ca-" + node.get("position");
+                  automaticAlias
+                      ? certificateAlias(material)
+                      : material == terminal ? alias : alias + "-ca-" + node.get("position");
               add(resolved, aliases, asset, material, nodeAlias, "TRUST");
               refs.add(ref(asset, material, nodeAlias, "TRUST"));
               if (strict) valid(material);
@@ -163,12 +201,12 @@ public class WorkflowValidator {
           require(!type.equals("KEYSTORE") || privateCount > 0, "Keystore至少包含一个私钥条目");
         }
         c.put("resolvedEntries", resolved);
-        earlier.add(key);
+        earlier.put(key, str(c, "filename", "store.p12"));
       } else {
         transfer = true;
         if (type.equals("HTTP")) fixed.prepare(c, refs, strict);
         String source = str(c, "sourceStep", "");
-        if (!source.isBlank()) require(earlier.contains(source), "产物来源必须是前序制作步骤");
+        if (!source.isBlank()) require(earlier.containsKey(source), "文件来源必须是前序制作或 SFTP 读取步骤");
         if (c.get("serverId") != null) {
           var server = servers.snapshot(id(c, "serverId"));
           require(type.equals(server.get("type")), "上传组件与服务器类型不匹配");
@@ -177,7 +215,8 @@ public class WorkflowValidator {
         if (c.get("certificateId") != null) {
           require(source.isBlank(), "文件输入只能选择产物或证书其中一种");
           long asset = id(c, "certificateId");
-          certs.detail(asset);
+          if (strict) certs.requireEnabled(asset);
+          else certs.detail(asset);
           String format = str(c, "exportFormat", "PEM");
           require(Set.of("PEM", "CHAIN_PEM", "DER", "P7B").contains(format), "公钥导出格式错误");
           c.put("exportFormat", format);
@@ -190,11 +229,27 @@ public class WorkflowValidator {
           }
         }
         boolean file = !source.isBlank() || c.get("certificateId") != null;
-        filename(c, "certificate.pem");
+        boolean reading = type.equals("SFTP") && "READ".equals(c.get("operation"));
+        if (!reading) filename(c, earlier.getOrDefault(source, "certificate.pem"));
         if (type.equals("SFTP")) {
           String operation = str(c, "operation", "UPLOAD");
-          require(Set.of("UPLOAD", "MOVE").contains(operation), "SFTP操作类型错误");
-          if (operation.equals("MOVE")) {
+          require(Set.of("UPLOAD", "MOVE", "READ").contains(operation), "SFTP操作类型错误");
+          if (operation.equals("READ")) {
+            require(!file, "读取操作不接受文件输入");
+            String path = str(c, "sourcePath", "");
+            if (strict || !path.isBlank()) {
+              require(
+                  path.startsWith("/")
+                      && !path.endsWith("/")
+                      && !path.contains("\\")
+                      && !path.codePoints().anyMatch(Character::isISOControl)
+                      && !Arrays.asList(path.split("/")).contains(".."),
+                  "请填写有效的远端绝对文件路径");
+              c.put("filename", path.substring(path.lastIndexOf('/') + 1));
+              filename(c, "certificate.pem");
+            }
+            earlier.put(key, str(c, "filename", "certificate.pem"));
+          } else if (operation.equals("MOVE")) {
             require(
                 str(c, "sourceStep", "").isBlank() && c.get("certificateId") == null,
                 "移动操作不需要文件输入");
@@ -247,7 +302,7 @@ public class WorkflowValidator {
         }
       }
     }
-    if (strict) require(transfer, "同步流程至少包含一个上传或HTTP调用组件");
+    if (strict) require(transfer, "同步流程至少包含一个 SFTP、HTTP 或 Shell 组件");
   }
 
   /**
@@ -269,6 +324,28 @@ public class WorkflowValidator {
             && !name.codePoints().anyMatch(Character::isISOControl),
         "文件名不合法");
     c.put("filename", name);
+  }
+
+  /**
+   * @description 以规范化 CN 和完整 DER SHA-256 指纹构建稳定别名，区分同名证书
+   * @author Freddy
+   * @date 2026-11-13
+   * @param material 已保存的证书材料 ID
+   * @return 长度不超过 165 字符且兼容 JKS 和 PKCS12 的小写别名
+   */
+  private String certificateAlias(long material) {
+    var row =
+        db.queryForMap(
+            "select common_name,fingerprint_sha256 from certificate_materials where id=?",
+            material);
+    String name =
+        Objects.toString(row.get("COMMON_NAME"), "")
+            .toLowerCase(Locale.ROOT)
+            .replaceAll("[^a-z0-9._-]+", "-");
+    if (name.length() > 100) name = name.substring(0, 100);
+    name = name.replaceAll("^[._-]+|[._-]+$", "");
+    if (name.isEmpty()) name = "certificate";
+    return name + "-" + row.get("FINGERPRINT_SHA256");
   }
 
   /**

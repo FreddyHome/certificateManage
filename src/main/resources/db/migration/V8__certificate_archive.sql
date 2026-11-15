@@ -1,0 +1,1 @@
+ALTER TABLE certificate_assets ADD COLUMN archived_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;

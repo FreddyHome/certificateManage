@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue';
 import { request } from '../../api/client';
-import { download } from '../../services/certificates';
+import {
+  download,
+  setCertificateEnabled,
+  archiveCertificate,
+  type CertificateRow,
+} from '../../services/certificates';
 import { run } from '../../composables/useAsyncAction';
 import { date } from '../../utils/format';
 import { filteredCertificates } from './certificates';
@@ -10,7 +15,7 @@ import IssueDialog from './components/IssueDialog.vue';
 import DetailDialog from './components/DetailDialog.vue';
 import { ElMessageBox } from 'element-plus';
 const props = defineProps<{ owner: string }>();
-const rows = ref<any[]>([]),
+const rows = ref<CertificateRow[]>([]),
   query = ref(''),
   purpose = ref(''),
   status = ref(''),
@@ -19,6 +24,20 @@ const rows = ref<any[]>([]),
   showIssue = ref(false),
   issueKind = ref('ROOT'),
   detailId = ref<number>();
+const changingIds = ref(new Set<number>());
+async function changeEnabled(row: { id: number; enabled?: boolean }, enabled: boolean) {
+  if (changingIds.value.has(row.id)) return;
+  changingIds.value.add(row.id);
+  try {
+    await run(async () => {
+      await setCertificateEnabled(row.id, enabled);
+      row.enabled = enabled;
+      await load();
+    });
+  } finally {
+    changingIds.value.delete(row.id);
+  }
+}
 const labels: Record<string, string> = {
   ROOT: '根证书',
   INTERMEDIATE: '中间证书',
@@ -31,20 +50,27 @@ const filtered = computed(() =>
 );
 const page = ref(1);
 const visible = computed(() => filtered.value.slice((page.value - 1) * 20, page.value * 20));
-async function remove(row: any) {
+async function archive(row: CertificateRow) {
+  if (changingIds.value.has(row.id)) return;
+  changingIds.value.add(row.id);
   try {
-    await ElMessageBox.confirm(
-      `确定删除证书“${row.name}”？被其他证书引用时无法删除。`,
-      '删除确认',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
-    );
-  } catch {
-    return;
+    try {
+      await ElMessageBox.confirm(
+        `确定归档证书“${row.name}”？归档后将停止同步、签发和通知，可在归档证书中查看、导出或恢复。`,
+        '归档确认',
+        { type: 'warning', confirmButtonText: '归档', cancelButtonText: '取消' },
+      );
+    } catch {
+      return;
+    }
+    await run(async () => {
+      await archiveCertificate(row.id);
+      await load();
+      page.value = Math.min(page.value, Math.max(1, Math.ceil(filtered.value.length / 20)));
+    });
+  } finally {
+    changingIds.value.delete(row.id);
   }
-  await run(async () => {
-    await request('/certificates/' + row.id, 'DELETE');
-    await load();
-  });
 }
 async function load() {
   loading.value = true;
@@ -64,11 +90,11 @@ function create(kind: string) {
   issueKind.value = kind;
   showIssue.value = true;
 }
-async function expand(row: any, expanded: any[]) {
+async function expand(row: CertificateRow, expanded: CertificateRow[]) {
   if (expanded.includes(row) && !row.chain)
     row.chain = await request(`/certificates/${row.id}/chain`);
 }
-function exported(row: any, format: string) {
+function exported(row: CertificateRow, format: string) {
   run(async () => {
     let pw = '';
     if (format === 'P12')
@@ -146,6 +172,17 @@ function exported(row: any, format: string) {
               >{{ row.status }}</el-tag
             ></template
           ></el-table-column
+        ><el-table-column label="启用状态" width="140">
+          <template #default="{ row }">
+            <el-switch
+              :model-value="row.enabled !== false"
+              :loading="changingIds.has(row.id)"
+              active-text="启用"
+              inactive-text="禁用"
+              inline-prompt
+              @change="(value: boolean | string | number) => changeEnabled(row, Boolean(value))"
+            />
+          </template> </el-table-column
         ><el-table-column label="操作" width="220"
           ><template #default="{ row }"
             ><el-button link type="primary" @click="detailId = row.id">查看</el-button
@@ -161,7 +198,9 @@ function exported(row: any, format: string) {
                   ></el-dropdown-menu
                 ></template
               ></el-dropdown
-            ><el-button link type="danger" @click="remove(row)">删除</el-button></template
+            ><el-button link type="danger" :loading="changingIds.has(row.id)" @click="archive(row)"
+              >归档</el-button
+            ></template
           ></el-table-column
         ></el-table
       >
@@ -173,7 +212,9 @@ function exported(row: any, format: string) {
       :data="visible"
       row-key="id"
       v-loading="loading"
-      @expand-change="(row: any, expanded: any[]) => run(() => expand(row, expanded))"
+      @expand-change="
+        (row: CertificateRow, expanded: CertificateRow[]) => run(() => expand(row, expanded))
+      "
       ><el-table-column type="expand" width="1"
         ><template #default="{ row }"
           ><div style="padding: 16px 36px">
@@ -222,11 +263,26 @@ function exported(row: any, format: string) {
         min-width="170"
         ><template #default="{ row }">{{ date(row.notAfter) }}</template></el-table-column
       ><el-table-column prop="status" label="状态" width="100" /><el-table-column
-        label="操作"
-        width="120"
+        label="启用状态"
+        width="140"
+      >
+        <template #default="{ row }">
+          <el-switch
+            :model-value="row.enabled !== false"
+            :loading="changingIds.has(row.id)"
+            active-text="启用"
+            inactive-text="禁用"
+            inline-prompt
+            @change="(value: boolean | string | number) => changeEnabled(row, Boolean(value))"
+          />
+        </template> </el-table-column
+      ><el-table-column label="操作" width="190"
         ><template #default="{ row }"
           ><el-button link type="primary" @click="detailId = row.id">查看</el-button
-          ><el-button link type="primary" @click="exported(row, 'PEM')">导出</el-button></template
+          ><el-button link type="primary" @click="exported(row, 'PEM')">导出</el-button>
+          <el-button link type="warning" :loading="changingIds.has(row.id)" @click="archive(row)"
+            >归档</el-button
+          ></template
         ></el-table-column
       ></el-table
     ><el-pagination

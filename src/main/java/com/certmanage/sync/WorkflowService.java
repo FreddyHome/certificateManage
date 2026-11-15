@@ -224,6 +224,11 @@ public class WorkflowService {
             ids.put((String) step.get("key"), stepId);
             if (c.get("serverId") != null)
               db.update("insert into sync_step_servers values(?,?)", stepId, id(c, "serverId"));
+            if (BusinessComponents.matches(c) && c.get("sourceServerId") != null)
+              db.update(
+                  "merge into sync_step_servers key(step_id,server_id) values(?,?)",
+                  stepId,
+                  id(c, "sourceServerId"));
             for (var ref : maps(c.get("references")))
               db.update(
                   "insert into sync_step_certificates values(?,?,?,?,?)",
@@ -377,6 +382,14 @@ public class WorkflowService {
               var snapshot = servers.snapshot(server);
               serverSnapshots.put(server, snapshot);
               step.put("serverSnapshot", snapshot);
+            }
+            if (BusinessComponents.matches(c)
+                && c.get("sourceServerId") != null
+                && !"TN_CERTIFICATE".equals(c.get("businessComponent"))) {
+              long source = id(c, "sourceServerId");
+              var snapshot = servers.snapshot(source);
+              serverSnapshots.put(source, snapshot);
+              step.put("sourceServerSnapshot", snapshot);
             }
           }
           task.put("steps", steps);

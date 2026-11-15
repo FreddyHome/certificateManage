@@ -31,18 +31,22 @@ function password() {
 <template>
   <el-container class="app-shell"
     ><el-aside width="210px"
-      ><div class="brand">CertHub <small>证书管理</small></div>
+      ><div class="brand">
+        <img class="brand-logo" src="/brand/cert-hub-256.png" alt="" width="44" height="44" />
+        <div class="brand-copy"><span>CertHub</span><small>证书管理</small></div>
+      </div>
       <el-menu
         router
         :default-active="route.path"
         background-color="#001529"
         text-color="#bac7d6"
         active-text-color="#409eff"
-        ><el-menu-item index="/certificates/own">自有证书</el-menu-item
         ><el-menu-item index="/certificates/customer">客户证书</el-menu-item
+        ><el-menu-item index="/certificates/own">自有证书</el-menu-item
         ><el-menu-item index="/customers">客户管理</el-menu-item
-        ><el-menu-item index="/servers">服务器管理</el-menu-item
         ><el-menu-item index="/sync">证书同步</el-menu-item
+        ><el-menu-item index="/servers">服务器管理</el-menu-item
+        ><el-menu-item index="/certificates/archived">归档证书</el-menu-item
         ><el-sub-menu index="system"
           ><template #title>系统管理</template
           ><el-menu-item index="/system/audit">审计日志</el-menu-item

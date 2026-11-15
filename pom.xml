@@ -77,20 +77,38 @@
             <includes>
               <include>src/test/java/com/certmanage/FixedComponentsWorkflowTest.java</include>
               <include>src/main/java/com/certmanage/sync/FixedHttpComponents.java</include>
+              <include>src/main/java/com/certmanage/sync/BusinessComponents.java</include>
+              <include>src/main/java/com/certmanage/common/Raw*.java</include>
+              <include>src/main/java/com/certmanage/common/ExecutionLog.java</include>
+              <include>src/main/java/com/certmanage/common/ExecutionLogController.java</include>
+              <include>src/test/java/com/certmanage/RawExecutionLog*.java</include>
+              <include>src/test/java/com/certmanage/RawAuditPoolTest.java</include>
               <include>src/main/java/com/certmanage/sync/WorkflowValidator.java</include>
               <include>src/main/java/com/certmanage/sync/WorkflowRunner.java</include>
               <include>src/main/java/com/certmanage/server/RemoteTransport.java</include>
+              <include>src/main/java/com/certmanage/server/ServerService.java</include>
+              <include>src/main/java/com/certmanage/server/SshCommandTransport.java</include>
+              <include>src/test/java/com/certmanage/server/SshSchemaMigrationTest.java</include>
+              <include>src/main/java/db/migration/V10__ssh_shell_steps.java</include>
               <include>src/test/java/com/certmanage/server/FixedHttpTransportTest.java</include>
               <include>src/test/java/com/certmanage/server/SftpTimestampTest.java</include>
               <include>src/main/java/com/certmanage/customer/*.java</include>
               <include>src/main/java/com/certmanage/certificate/CertificateService.java</include>
               <include>src/main/java/com/certmanage/certificate/CertificateController.java</include>
               <include>src/main/java/com/certmanage/sync/WorkflowService.java</include>
+              <include>src/main/java/com/certmanage/sync/StoreMaker.java</include>
+              <include>src/main/java/com/certmanage/notification/NotificationService.java</include>
               <include>src/main/java/com/certmanage/sync/WorkflowQueries.java</include>
               <include>src/main/java/com/certmanage/sync/WorkflowScheduler.java</include>
               <include>src/test/java/com/certmanage/customer/*.java</include>
               <include>src/test/java/com/certmanage/sync/*.java</include>
               <include>src/test/java/com/certmanage/CustomerIdentificationTest.java</include>
+              <include>src/test/java/com/certmanage/CertificateEnabledTest.java</include>
+              <include>src/test/java/com/certmanage/CertificateArchiveTest.java</include>
+              <include>src/test/java/com/certmanage/CertificateImportDeduplicationTest.java</include>
+              <include>src/test/java/com/certmanage/CertificateDeleteTest.java</include>
+              <include>src/test/java/com/certmanage/WorkflowTest.java</include>
+              <include>src/test/java/com/certmanage/notification/*.java</include>
             </includes>
             <googleJavaFormat>
               <version>1.30.0</version>

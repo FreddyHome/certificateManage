@@ -3,9 +3,13 @@ import { computed } from 'vue';
 import FixedHttpStepConfig from './FixedHttpStepConfig.vue';
 import StoreStepConfig from './StoreStepConfig.vue';
 import TransferStepConfig from './TransferStepConfig.vue';
-import { isStoreStep, stepTypes, stepLabel } from './sync-editor';
+import BusinessStepConfig from './BusinessStepConfig.vue';
+import ShellStepConfig from './ShellStepConfig.vue';
+import { businessLabels } from './business-editor';
+import { isStoreStep, stepLabel } from './sync-editor';
 import type {
   HttpComponent,
+  BusinessComponent,
   SyncCustomer,
   ParameterMaps,
   StepType,
@@ -29,6 +33,7 @@ const emit = defineEmits<{
   save: [];
   validate: [];
   add: [type: StepType, component?: HttpComponent];
+  addBusiness: [component: BusinessComponent];
   move: [index: number, direction: number];
   duplicate: [step: SyncStep];
 }>();
@@ -73,7 +78,15 @@ const validationRows = computed(
         <el-form-item label="步骤名称">
           <el-input v-model="s.name" />
         </el-form-item>
-        <StoreStepConfig v-if="isStoreStep(s)" :s="s" :certs="certs" />
+        <BusinessStepConfig
+          v-if="s.type === 'HTTP' && s.config.businessComponent"
+          :s="s"
+          :servers="servers"
+          :certs="certs"
+          :customers="customers"
+        />
+        <ShellStepConfig v-else-if="s.type === 'SSH'" :s="s" :servers="servers" />
+        <StoreStepConfig v-else-if="isStoreStep(s)" :s="s" :certs="certs" />
         <FixedHttpStepConfig
           v-else-if="
             s.type === 'HTTP' && s.config.httpComponent && s.config.httpComponent !== 'GENERIC'
@@ -92,13 +105,13 @@ const validationRows = computed(
           :maps="maps"
         />
       </el-card>
-      <el-button v-for="t in stepTypes" :key="t" @click="emit('add', t)"
-        >添加 {{ t === 'HTTP' ? '通用 HTTP' : t }}</el-button
+      <el-button
+        v-for="(label, component) in businessLabels"
+        :key="component"
+        @click="emit('addBusiness', component)"
+        >添加 {{ label }}</el-button
       >
-      <el-button @click="emit('add', 'HTTP', 'RELOAD_KEYSTORE')">添加重载 Keystore</el-button>
-      <el-button @click="emit('add', 'HTTP', 'UPDATE_TN_PARTNER')"
-        >添加更新 TNPartner 证书</el-button
-      >
+      <el-button @click="emit('add', 'SSH')">添加 Shell 命令执行</el-button>
       <section v-if="validation">
         <el-alert
           :title="validation.valid ? '校验通过' : '校验失败'"

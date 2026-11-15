@@ -25,6 +25,54 @@ export function previewCertificateImport(input: FormData): Promise<ImportPreview
   return request('/imports/preview', 'POST', input);
 }
 
-export function commitCertificateImport(input: FormData): Promise<{ id: number }> {
+export interface ImportResult {
+  id: number;
+  importedCount: number;
+  skippedCount: number;
+  restoredCount: number;
+}
+
+export function commitCertificateImport(input: FormData): Promise<ImportResult> {
   return request('/imports/commit', 'POST', input, { idempotent: true });
+}
+
+/** 修改证书资产业务启用状态；查看与导出仍然可用。 */
+export function setCertificateEnabled(id: number, enabled: boolean): Promise<void> {
+  return request(`/certificates/${id}/enabled`, 'PATCH', { enabled });
+}
+
+export type CertificateOwner = 'OWN' | 'CUSTOMER';
+
+export interface CertificateRow {
+  id: number;
+  name: string;
+  owner: CertificateOwner;
+  kind: string;
+  purpose: string;
+  customer?: string;
+  serial: string;
+  issuer: string;
+  notAfter: string;
+  status: string;
+  depth: number;
+  hasKey: boolean;
+  enabled: boolean;
+  archivedAt: string | null;
+  chain?: CertificateRow[];
+}
+
+export function archiveCertificate(id: number): Promise<void> {
+  return request(`/certificates/${id}/archive`, 'POST');
+}
+
+export function restoreCertificate(id: number): Promise<void> {
+  return request(`/certificates/${id}/restore`, 'POST');
+}
+
+export function deleteArchivedCertificate(id: number): Promise<void> {
+  return request(`/certificates/${id}`, 'DELETE');
+}
+
+export function listArchivedCertificates(owner?: CertificateOwner): Promise<CertificateRow[]> {
+  return request(`/certificates/archived${owner ? `?owner=${owner}` : ''}`);
 }

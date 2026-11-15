@@ -34,7 +34,7 @@ onMounted(() =>
 const authFields = computed(() => {
   const c = form.value?.config;
   if (!c) return [];
-  if (form.value.type === 'SFTP')
+  if (['SFTP', 'SSH'].includes(form.value.type))
     return c.authType === 'KEY' ? ['privateKey', 'passphrase'] : ['password'];
   return c.authType === 'BASIC'
     ? ['username', 'password']
@@ -181,7 +181,7 @@ async function remove(r: any) {
         ><el-select v-model="form.type" :disabled="!!form.id" @change="defaults"
           ><el-option label="HTTPS / HTTP" value="HTTP" /><el-option
             label="SFTP"
-            value="SFTP" /></el-select></el-form-item
+            value="SFTP" /><el-option label="SSH / Shell" value="SSH" /></el-select></el-form-item
       ><el-form-item label="说明"><el-input v-model="form.description" /></el-form-item
       ><el-switch v-model="form.enabled" active-text="启用" /><el-alert
         title="已保存的凭据留空保留，勾选清除后保存才会移除。"
@@ -199,7 +199,7 @@ async function remove(r: any) {
             v-for="a in form.type === 'HTTP' ? ['NONE', 'BASIC', 'BEARER'] : ['PASSWORD', 'KEY']"
             :key="a"
             :value="a" /></el-select></el-form-item
-      ><el-form-item v-if="form.type === 'SFTP'" label="端口"
+      ><el-form-item v-if="['SFTP', 'SSH'].includes(form.type)" label="端口"
         ><el-input-number v-model="form.config.port" :min="1" :max="65535" /></el-form-item
       ><el-form-item
         v-for="f in authFields"
@@ -214,7 +214,9 @@ async function remove(r: any) {
       ><el-form-item
         v-for="f in ['connectTimeout', 'readTimeout']"
         :key="f"
-        :label="fieldLabels[f] + '（秒）'"
+        :label="
+          (form.type === 'SSH' && f === 'readTimeout' ? '认证超时' : fieldLabels[f]) + '（秒）'
+        "
         ><el-input-number v-model="form.config[f]" :min="1" :max="300" /></el-form-item
       ><el-form-item v-if="clearFields.length" label="明确清除已保存凭据（勾选后保存生效）"
         ><el-checkbox-group v-model="form.config.clearSecrets"
@@ -228,8 +230,11 @@ async function remove(r: any) {
             v-for="c in certs"
             :key="c.id"
             :value="c.id"
+            :disabled="c.enabled === false && !form.config.trustAssetIds?.includes(c.id)"
             :label="
-              [c.commonName || c.name, c.customer, c.serial].filter(Boolean).join(' · ')
+              [c.commonName || c.name, c.customer, c.serial, c.enabled === false ? '已禁用' : '']
+                .filter(Boolean)
+                .join(' · ')
             " /></el-select></el-form-item
       ><el-form-item
         v-if="form.type === 'HTTP'"

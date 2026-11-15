@@ -98,7 +98,7 @@ public class FixedHttpComponents {
     require(!external.isBlank() && !idType.isBlank(), "客户的对外标识和标识类型必填");
     var candidates =
         db.queryForList(
-            "select a.id from certificate_assets a join certificate_materials m on m.id=a.material_id where a.owner_type='CUSTOMER' and a.customer_id=? and a.purpose=? and a.deleted_at is null order by m.not_after desc,a.id desc",
+            "select a.id from certificate_assets a join certificate_materials m on m.id=a.material_id where a.owner_type='CUSTOMER' and a.customer_id=? and a.purpose=? and a.deleted_at is null and a.archived_at is null and a.enabled=true order by m.not_after desc,a.id desc",
             Long.class,
             customer,
             purpose);
