@@ -1,6 +1,6 @@
 # 数据库表设计
 
-> 当前口径（2026-11-14）：实际迁移为 V1–V10，共 36 张业务/辅助表，不含 Flyway 自身表。V10 是 `src/main/java/db/migration/V10__ssh_shell_steps.java`，调整 SSH 类型约束而不新增表。下文 V1/V4/V5 表数量和字段说明保留对应阶段背景；`app_sessions`、`scheduler_state` 目前预留。完整核对见[需求与设计核对基线](requirements-design-review-2026-11-14.md)。
+> 当前口径（2026-11-16）：实际迁移为 V1–V12，共36张业务/辅助表，不含Flyway自身表。V10为SSH类型约束的Java迁移；V11新增计划JSON字段，V12扩展调度表达式长度，均不新增表。下文V1/V4/V5表数量及基础字典保留对应阶段背景；`app_sessions`、`scheduler_state`目前预留。其他差异见[历史核对基线](requirements-design-review-2026-11-14.md)。
 
 ## 当前迁移索引
 
@@ -16,8 +16,24 @@
 | V8 | 证书 `archived_at` | 0 |
 | V9 | 原始审计 `execution_log_raw` 及摘要的 `raw_trace_id` 关联 | 1 |
 | V10 | Java 迁移，扩展服务器协议及步骤类型白名单以接受 SSH | 0 |
+| V11 | `sync_tasks.schedule_json CLOB`，保存结构化执行计划，旧记录允许为空 | 0 |
+| V12 | `sync_tasks.cron`由`VARCHAR(100)`扩为`VARCHAR(500)`，容纳五列多选 | 0 |
 
-当前以 `src/main/resources/db/migration` 的 V1–V9 SQL 与 `src/main/java/db/migration` 的 V10 Java 迁移为执行来源。`doc/sql` 为 SQL 文档副本；不要因没有 V10 SQL 副本而补建重复迁移。以下是历史阶段设计与基础字段字典。
+当前以 `src/main/resources/db/migration` 的V1–V9、V11/V12 SQL及 `src/main/java/db/migration` 的V10 Java迁移为执行来源。`doc/sql`保留历史SQL文档副本，不作为运行迁移来源；不要补建重复版本。以下保留历史基础字段字典。
+
+### 执行计划字段（V11/V12）
+
+| 字段 | 当前类型 | 作用 |
+| --- | --- | --- |
+| `schedule_json` | CLOB，可空 | 规范化计划；CALENDAR含月份、日期、星期、小时、分钟列表及timezone；CUSTOM保留原cron；旧频率继续兼容 |
+| `cron` | VARCHAR(500)，非空 | 服务端从计划派生的六字段表达式，供调度器及旧API使用；新五列计划秒为0 |
+| `timezone` | VARCHAR(100)，非空 | IANA时区；与计划归一化结果同事务保存，默认Asia/Shanghai |
+| `schedule_enabled` | BOOLEAN，非空 | 内部调度兼容标记；CALENDAR在READY保存时为true、DRAFT为false，不再作为页面执行方式选择 |
+| `next_fire_at` | TIMESTAMP WITH TIME ZONE，可空 | 启用后计算的下次触发时间，草稿/未启用为空 |
+
+规范化计划与cron/timezone/next_fire_at同事务写入，不接受客户端摘要代替服务端计算。旧记录schedule_json为空时按原cron解析回显；查询与升级不批量启用旧任务。V11/V12保留旧任务、原表达式及启用状态，备份恢复仍须使用原数据库与主密钥。
+
+IS keyStore自动选证只增加步骤config_json中的selectionMode/certificateCn等配置语义，不新增证书版本表。certificateId确定基准实际CN，certificateCn仅供前端预览；候选从certificate_assets、certificate_materials及private_keys查询。实际选中材料仍记录到既有任务/执行引用及snapshot_json中；软删除保留的基准材料可用于读取CN，不能作为已删除候选执行。详见[主设计第17节](design.md#17-证书自动选取与五列执行计划2026-11-16)。
 
 > V5新增统一日志表 `execution_logs`，核心列 `actor_name`（执行人）、`occurred_at`（执行时间）、`message`（内容描述）；额外来源、结果及关联ID仅用于筛选与追踪。旧操作审计及已有执行结果快照迁入，后续所有操作/执行事件汇总至此表。脚本为 `sql/V5__execution_audit_logs.sql`，不提供更新删除API；原 `audit_events` 作为兼容记录保留。当前总计35张业务/辅助表。
 

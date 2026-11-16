@@ -37,7 +37,7 @@ class WorkflowQueries {
   }
 
   /**
-   * @description 映射任务基础字段，保留空的下次触发时间及原有响应字段。
+   * @description 映射任务及业务计划摘要，旧记录仅做无损兼容解析并保留原调度字段。
    * @author Freddy
    * @date 2026-11-12
    * @param r 当前查询结果行
@@ -55,6 +55,14 @@ class WorkflowQueries {
     m.put("scheduleEnabled", r.getBoolean("schedule_enabled"));
     m.put("cron", r.getString("cron"));
     m.put("timezone", r.getString("timezone"));
+    String scheduleJson = r.getString("schedule_json");
+    var schedule =
+        scheduleJson == null
+            ? SchedulePlan.legacy(r.getString("cron"), r.getString("timezone"))
+            : SchedulePlan.normalize(decode.apply(scheduleJson));
+    m.put("schedule", schedule.plan());
+    m.put(
+        "scheduleSummary", schedule.summary() + (r.getBoolean("schedule_enabled") ? "" : "（未启用）"));
     m.put(
         "nextFireAt",
         r.getObject("next_fire_at") == null

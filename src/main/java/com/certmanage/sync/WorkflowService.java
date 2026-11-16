@@ -135,10 +135,18 @@ public class WorkflowService {
               "任务名称必填，名称或描述过长");
           String state = str(input, "state", "DRAFT");
           require(Set.of("DRAFT", "READY").contains(state), "任务状态错误");
-          boolean enabled = Boolean.TRUE.equals(input.get("scheduleEnabled"));
+          boolean calendar =
+              input.get("schedule") instanceof Map<?, ?> s && "CALENDAR".equals(s.get("frequency"));
+          boolean enabled =
+              calendar ? state.equals("READY") : Boolean.TRUE.equals(input.get("scheduleEnabled"));
           require(!enabled || state.equals("READY"), "草稿不能启用定时");
-          String cron = str(input, "cron", "0 0 2 * * *"),
-              zone = str(input, "timezone", "Asia/Shanghai");
+          var schedule =
+              input.containsKey("schedule")
+                  ? SchedulePlan.normalize(map(input.get("schedule")))
+                  : SchedulePlan.legacy(
+                      str(input, "cron", str(old, "cron", "0 0 2 * * *")),
+                      str(input, "timezone", str(old, "timezone", "Asia/Shanghai")));
+          String cron = schedule.cron(), zone = schedule.timezone();
           var next = validator.nextTimes(cron, zone);
           var oldByKey = new HashMap<String, Map<String, Object>>();
           for (var step : maps(old.get("steps"))) oldByKey.put(str(step, "key", ""), step);
@@ -177,25 +185,27 @@ public class WorkflowService {
           long actor = audit.actor(user);
           if (id == null) {
             db.update(
-                "insert into sync_tasks(name,description,state,schedule_enabled,cron,timezone,next_fire_at,created_by,updated_by) values(?,?,?,?,?,?,?,?,?)",
+                "insert into sync_tasks(name,description,state,schedule_enabled,cron,timezone,schedule_json,next_fire_at,created_by,updated_by) values(?,?,?,?,?,?,?,?,?,?)",
                 name,
                 description,
                 state,
                 enabled,
                 cron,
                 zone,
+                encode(schedule.plan()),
                 enabled ? ZonedDateTime.parse(next.getFirst()).toOffsetDateTime() : null,
                 actor,
                 actor);
           } else
             db.update(
-                "update sync_tasks set name=?,description=?,state=?,schedule_enabled=?,cron=?,timezone=?,next_fire_at=?,config_revision=config_revision+1,updated_by=?,updated_at=current_timestamp where id=?",
+                "update sync_tasks set name=?,description=?,state=?,schedule_enabled=?,cron=?,timezone=?,schedule_json=?,next_fire_at=?,config_revision=config_revision+1,updated_by=?,updated_at=current_timestamp where id=?",
                 name,
                 description,
                 state,
                 enabled,
                 cron,
                 zone,
+                encode(schedule.plan()),
                 enabled ? ZonedDateTime.parse(next.getFirst()).toOffsetDateTime() : null,
                 actor,
                 id);

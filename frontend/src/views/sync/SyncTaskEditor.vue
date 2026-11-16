@@ -5,6 +5,7 @@ import StoreStepConfig from './StoreStepConfig.vue';
 import TransferStepConfig from './TransferStepConfig.vue';
 import BusinessStepConfig from './BusinessStepConfig.vue';
 import ShellStepConfig from './ShellStepConfig.vue';
+import ScheduleEditor from './ScheduleEditor.vue';
 import { businessLabels } from './business-editor';
 import { isStoreStep, stepLabel } from './sync-editor';
 import type {
@@ -60,13 +61,7 @@ const validationRows = computed(
           <el-option label="就绪" value="READY" />
         </el-select>
       </el-form-item>
-      <el-switch v-model="form.scheduleEnabled" active-text="启用定时" />
-      <el-form-item label="六字段 Cron">
-        <el-input v-model="form.cron" />
-      </el-form-item>
-      <el-form-item label="时区">
-        <el-input v-model="form.timezone" />
-      </el-form-item>
+      <ScheduleEditor :key="form.id || 'new'" :task="form" />
       <el-card v-for="(s, i) in form.steps" :key="s.key" style="margin: 16px 0">
         <template #header>
           <b>{{ Number(i) + 1 }} · {{ stepLabel(s) }}</b>
@@ -118,7 +113,6 @@ const validationRows = computed(
           :type="validation.valid ? 'success' : 'error'"
           :closable="false"
         />
-        <p>下次定时执行：{{ (validation.nextTimes || []).join('、') || '未启用定时' }}</p>
         <el-table v-if="validation.entries" :data="validationRows">
           <el-table-column prop="stepName" label="步骤" />
           <el-table-column prop="alias" label="别名" />

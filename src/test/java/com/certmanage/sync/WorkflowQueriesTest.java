@@ -36,7 +36,7 @@ class WorkflowQueriesTest {
                 "jdbc:h2:mem:" + UUID.randomUUID() + ";DB_CLOSE_DELAY=-1", "sa", ""));
     db = new JdbcTemplate(source);
     db.execute(
-        "create table sync_tasks(id bigint primary key,name varchar,description varchar,config_revision bigint,state varchar,schedule_enabled boolean,cron varchar,timezone varchar,next_fire_at timestamp with time zone,deleted_at timestamp with time zone)");
+        "create table sync_tasks(id bigint primary key,name varchar,description varchar,config_revision bigint,state varchar,schedule_enabled boolean,cron varchar,timezone varchar,next_fire_at timestamp with time zone,deleted_at timestamp with time zone,schedule_json clob)");
     db.execute(
         "create table sync_runs(id bigint primary key,task_id bigint,status varchar,created_at timestamp with time zone)");
     db.execute(

@@ -8,7 +8,12 @@ import type {
   SyncTask,
   SyncTaskSummary,
   SyncValidation,
+  ExecutionSchedule,
+  SchedulePreview,
 } from './sync-types';
+
+export const previewSyncSchedule = (schedule: ExecutionSchedule) =>
+  request<SchedulePreview>('/sync-tasks/schedule-preview', 'POST', schedule);
 
 export const listSyncTasks = () => request<SyncTaskSummary[]>('/sync-tasks');
 export const getSyncTask = (id: number) => request<SyncTask>(`/sync-tasks/${id}`);

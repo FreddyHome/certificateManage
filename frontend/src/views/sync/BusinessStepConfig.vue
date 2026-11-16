@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { request } from '../../api/client';
 import RequestParameters from '../../components/RequestParameters.vue';
-import { eligibleChains } from './business-editor';
+import { eligibleChains, eligibleOwnChains } from './business-editor';
 import { certificateLabel } from './sync-editor';
 import type {
   SyncCertificate,
@@ -28,13 +28,21 @@ const own = computed(() =>
       v.owner === 'OWN' &&
       v.kind === 'LEAF' &&
       v.hasKey &&
-      v.enabled !== false &&
-      v.chainAvailable !== false &&
-      !v.archivedAt,
+      ((c.value.selectionMode !== 'MANUAL' && v.id === c.value.certificateId) ||
+        (v.enabled !== false && v.chainAvailable !== false && !v.archivedAt)),
   ),
 );
+const ownChains = computed(() =>
+  eligibleOwnChains(props.certs, c.value.certificateId, c.value.certificateCn),
+);
 const selected = computed(() =>
-  isKey.value || c.value.selectionMode === 'MANUAL' ? c.value.certificateId : chains.value[0]?.id,
+  isKey.value
+    ? c.value.selectionMode === 'MANUAL'
+      ? c.value.certificateId
+      : ownChains.value[0]?.id
+    : c.value.selectionMode === 'MANUAL'
+      ? c.value.certificateId
+      : chains.value[0]?.id,
 );
 const customer = computed(() => props.customers.find((v) => v.id === c.value.customerId));
 const nodes = ref<SyncChainNode[]>([]);
@@ -199,15 +207,39 @@ function resolvedUrl(serverId: number | null | undefined, path: string | undefin
         </p>
         <el-checkbox v-else v-model="c.deleteExpired">删除原 truststore 中已过期的证书</el-checkbox>
       </template>
-      <el-form-item v-if="isKey" label="自有证书（终端证书）" required>
-        <el-select v-model="c.certificateId" filterable
+      <el-form-item v-if="isKey" label="证书选择方式">
+        <el-radio-group v-model="c.selectionMode">
+          <el-radio value="AUTO">自动选择同 CN 到期最晚的可用链</el-radio>
+          <el-radio value="MANUAL">指定证书</el-radio>
+        </el-radio-group>
+      </el-form-item>
+      <el-form-item
+        v-if="isKey"
+        :label="c.selectionMode === 'MANUAL' ? '自有证书（终端证书）' : '匹配 CN 的基准叶子证书'"
+        required
+      >
+        <el-select v-model="c.certificateId" filterable @change="delete c.certificateCn"
           ><el-option
+            v-if="
+              c.selectionMode !== 'MANUAL' &&
+              c.certificateCn &&
+              !own.some((cert) => cert.id === c.certificateId)
+            "
+            :value="c.certificateId!"
+            :label="`${c.certificateCn}（原基准）`" />
+          <el-option
             v-for="cert in own"
             :key="cert.id"
             :value="cert.id"
             :label="certificateLabel(cert)"
         /></el-select>
       </el-form-item>
+      <p v-if="isKey && c.selectionMode !== 'MANUAL'" class="stage-note">
+        每次入队按基准叶子 CN
+        精确匹配，选择含私钥、已启用且整链有效的自有证书中到期最晚的一条；无需等待旧证书过期。当前：{{
+          ownChains[0] ? certificateLabel(ownChains[0]) : '暂无同 CN 可用证书链'
+        }}。基准证书后续过期不影响匹配；没有可用链时任务失败。
+      </p>
       <el-form-item v-if="isKey" label="别名（可选）">
         <el-input v-model="c.alias" placeholder="留空使用证书 CN 原值，不附加指纹或其他编码" />
       </el-form-item>

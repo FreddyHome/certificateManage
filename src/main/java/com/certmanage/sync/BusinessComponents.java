@@ -70,7 +70,7 @@ public class BusinessComponents {
   }
 
   /**
-   * @description 解析服务器路径和证书引用；私钥库别名留空时仅采用终端证书CN
+   * @description 解析服务器路径和证书引用；自动私钥库按叶子CN选择到期最晚的有效链，别名留空采用CN
    * @author Freddy
    * @date 2026-11-13
    * @param step 含秘密版本的步骤
@@ -158,12 +158,39 @@ public class BusinessComponents {
     if (kind.equals("IS_KEYSTORE")) {
       if (c.get("certificateId") != null) {
         selected = id(c, "certificateId");
-        var d = certs.detail(selected);
-        require(
-            "OWN".equals(d.get("owner"))
-                && "LEAF".equals(d.get("kind"))
-                && Boolean.TRUE.equals(d.get("hasKey")),
-            "请选择含私钥的自有终端证书");
+        if (mode.equals("AUTO")) {
+          // 基准只用于匹配CN，软删除后仍保留材料；候选必须满足正常可用条件。
+          var names =
+              db.queryForList(
+                  "select m.common_name from certificate_assets a join certificate_materials m on m.id=a.material_id where a.id=? and a.owner_type='OWN' and a.certificate_kind='LEAF' and exists(select 1 from private_keys p where p.own_asset_id=a.id)",
+                  String.class,
+                  selected);
+          require(names.size() == 1, "请选择含私钥的自有终端证书作为CN基准");
+          String cn = Objects.toString(names.getFirst(), "");
+          require(!cn.isBlank(), "自动选证要求基准叶子证书CN非空");
+          c.put("certificateCn", cn);
+          selected = null;
+          var candidates =
+              db.queryForList(
+                  "select a.id from certificate_assets a join certificate_materials m on m.id=a.material_id where a.owner_type='OWN' and a.certificate_kind='LEAF' and m.common_name=? and a.deleted_at is null and a.archived_at is null and a.enabled=true and exists(select 1 from private_keys p where p.own_asset_id=a.id) order by m.not_after desc,a.id desc",
+                  Long.class,
+                  cn);
+          for (long asset : candidates) {
+            if (available(asset)) {
+              selected = asset;
+              break;
+            }
+          }
+          if (strict) require(selected != null, "同CN的自有证书中没有含私钥且整链有效的可用证书");
+        } else {
+          var d = certs.detail(selected);
+          require(
+              "OWN".equals(d.get("owner"))
+                  && "LEAF".equals(d.get("kind"))
+                  && Boolean.TRUE.equals(d.get("hasKey")),
+              "请选择含私钥的自有终端证书");
+          c.remove("certificateCn");
+        }
       } else if (strict) throw new IllegalArgumentException("请选择自有终端证书");
     } else {
       String purpose = str(c, "purpose", "GENERAL");

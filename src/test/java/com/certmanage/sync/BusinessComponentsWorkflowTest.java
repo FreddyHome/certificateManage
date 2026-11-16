@@ -87,6 +87,159 @@ class BusinessComponentsWorkflowTest {
     }
   }
 
+  /**
+   * @description 验证自动私钥库按叶子CN选择最新有效链，入队快照固定且下次入队重新解析
+   * @author Freddy
+   * @date 2026-11-16
+   * @throws Exception 证书生成或证书库读取失败
+   */
+  @Test
+  void automaticKeyStoreReselectsSameCnAtEnqueueAndFreezesRun() throws Exception {
+    try (var f = new Fixture("PKCS12")) {
+      var config = f.config("IS_KEYSTORE");
+      config.put("certificateId", f.own);
+      long task = save(config);
+      var newer =
+          crypto.issue(
+              "LEAF", "Business Leaf", 180, f.root.cert(), f.root.key(), List.of(), "GENERAL");
+      long replacement =
+          ((Number)
+                  certs
+                      .saveImport(
+                          new CertificateCrypto.Parsed(
+                              List.of(f.root.cert(), newer.cert()), newer.key()),
+                          "OWN",
+                          null,
+                          "GENERAL",
+                          "admin")
+                      .get("id"))
+              .longValue();
+      long first = workflows.enqueue(task, null, "admin");
+      var newest =
+          crypto.issue(
+              "LEAF", "Business Leaf", 200, f.root.cert(), f.root.key(), List.of(), "GENERAL");
+      certs.saveImport(
+          new CertificateCrypto.Parsed(List.of(f.root.cert(), newest.cert()), newest.key()),
+          "OWN",
+          null,
+          "GENERAL",
+          "admin");
+      var unrelated =
+          crypto.issue(
+              "LEAF", "Other Business", 250, f.root.cert(), f.root.key(), List.of(), "GENERAL");
+      certs.saveImport(
+          new CertificateCrypto.Parsed(List.of(f.root.cert(), unrelated.cert()), unrelated.key()),
+          "OWN",
+          null,
+          "GENERAL",
+          "admin");
+      runner.executeRun(first);
+      assertEquals("SUCCESS", workflows.runDetail(first).get("status"));
+      var store = KeyStore.getInstance("PKCS12");
+      store.load(
+          new ByteArrayInputStream(
+              Base64.getDecoder().decode(f.updated.get().path("content").asText())),
+          "short".toCharArray());
+      assertEquals(newer.cert(), store.getCertificate("Business Leaf"));
+      assertNotNull(store.getKey("Business Leaf", "short".toCharArray()));
+      assertEquals(2, store.getCertificateChain("Business Leaf").length);
+      db.update(
+          "update certificate_assets set archived_at=current_timestamp,deleted_at=current_timestamp where id=?",
+          f.own);
+      long second = workflows.enqueue(task, null, "admin");
+      runner.executeRun(second);
+      assertEquals("SUCCESS", workflows.runDetail(second).get("status"));
+      store.load(
+          new ByteArrayInputStream(
+              Base64.getDecoder().decode(f.updated.get().path("content").asText())),
+          "short".toCharArray());
+      assertEquals(newest.cert(), store.getCertificate("Business Leaf"));
+      assertNotEquals(f.own, replacement);
+    }
+  }
+
+  /**
+   * @description 验证自动模式跳过不可用候选及失效基准，指定模式保持固定证书
+   * @author Freddy
+   * @date 2026-11-16
+   * @throws Exception 证书生成或任务校验失败
+   */
+  @Test
+  void automaticKeyStoreSkipsUnavailableCandidatesAndManualStaysFixed() throws Exception {
+    try (var f = new Fixture("JKS")) {
+      var config = f.config("IS_KEYSTORE");
+      config.put("certificateId", f.own);
+      config.put("selectionMode", "MANUAL");
+      long fixed = save(config);
+      long valid = 0;
+      for (int days : List.of(120, 140, 160, 180, 200, 220)) {
+        var leaf =
+            crypto.issue(
+                "LEAF", "Business Leaf", days, f.root.cert(), f.root.key(), List.of(), "GENERAL");
+        long id =
+            ((Number)
+                    certs
+                        .saveImport(
+                            new CertificateCrypto.Parsed(
+                                List.of(f.root.cert(), leaf.cert()),
+                                days == 140 ? null : leaf.key()),
+                            "OWN",
+                            null,
+                            "GENERAL",
+                            "admin")
+                        .get("id"))
+                .longValue();
+        if (days == 120) valid = id;
+        if (days == 160) db.update("update certificate_assets set enabled=false where id=?", id);
+        if (days == 180)
+          db.update("update certificate_assets set archived_at=current_timestamp where id=?", id);
+        if (days == 200)
+          db.update("update certificate_assets set deleted_at=current_timestamp where id=?", id);
+        if (days == 220) {
+          var builder =
+              new JcaX509v3CertificateBuilder(
+                  new X500Name("CN=Business Root"),
+                  BigInteger.valueOf(220),
+                  Date.from(Instant.now().minusSeconds(86400)),
+                  Date.from(Instant.now().minusSeconds(1)),
+                  new X500Name("CN=Business Leaf"),
+                  leaf.cert().getPublicKey());
+          var expired =
+              new JcaX509CertificateConverter()
+                  .getCertificate(
+                      builder.build(
+                          new JcaContentSignerBuilder("SHA256withRSA").build(f.root.key())));
+          db.update(
+              "update certificate_materials set certificate_der=? where id=(select material_id from certificate_assets where id=?)",
+              expired.getEncoded(),
+              id);
+        }
+      }
+      long run = workflows.enqueue(fixed, null, "admin");
+      var snapshot =
+          json.readTree(
+              db.queryForObject(
+                  "select snapshot_json from sync_runs where id=?", String.class, run));
+      assertEquals(
+          f.own, snapshot.path("steps").get(0).path("config").path("resolvedAssetId").asLong());
+      runner.executeRun(run);
+      config.put("selectionMode", "AUTO");
+      long automatic = save(config);
+      db.update("update certificate_assets set enabled=false where id=?", f.own);
+      long autoRun = workflows.enqueue(automatic, null, "admin");
+      var autoSnapshot =
+          json.readTree(
+              db.queryForObject(
+                  "select snapshot_json from sync_runs where id=?", String.class, autoRun));
+      assertEquals(
+          valid, autoSnapshot.path("steps").get(0).path("config").path("resolvedAssetId").asLong());
+      runner.executeRun(autoRun);
+      db.update("update certificate_assets set enabled=false where id=?", valid);
+      assertThrows(
+          IllegalArgumentException.class, () -> workflows.enqueue(automatic, null, "admin"));
+    }
+  }
+
   @Test
   void cumulativeArtifactsOverTwentyFiveMiBStopBeforeThirdWrite() throws Exception {
     try (var f = new Fixture("JKS")) {

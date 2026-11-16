@@ -1,0 +1,1 @@
+ALTER TABLE sync_tasks ALTER COLUMN cron VARCHAR(500);

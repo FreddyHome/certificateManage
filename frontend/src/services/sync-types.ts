@@ -38,6 +38,7 @@ export interface TransferConfig {
   sourceHeaders?: Parameters;
   sourceQuery?: Parameters;
   selectionMode?: 'AUTO' | 'MANUAL';
+  certificateCn?: string;
   materialIds?: number[];
   deleteExpired?: boolean;
   password?: string;
@@ -105,8 +106,33 @@ export interface SyncTaskSummary {
   scheduleEnabled: boolean;
   cron: string;
   timezone: string;
+  schedule?: ExecutionSchedule;
+  scheduleSummary?: string;
   lastStatus?: string | null;
   nextFireAt?: string | null;
+}
+
+export type ScheduleFrequency =
+  'DAILY' | 'WEEKLY' | 'MONTHLY' | 'HOURLY' | 'MINUTES' | 'CUSTOM' | 'CALENDAR';
+export interface ExecutionSchedule {
+  frequency: ScheduleFrequency;
+  timezone: string;
+  time?: string;
+  weekdays?: number[];
+  monthDays?: number[];
+  lastDay?: boolean;
+  minuteOfHour?: number;
+  intervalMinutes?: number;
+  cron?: string;
+  months?: number[];
+  hours?: number[];
+  minutes?: number[];
+}
+
+export interface SchedulePreview {
+  summary: string;
+  nextTimes: string[];
+  schedule?: ExecutionSchedule;
 }
 
 export interface SyncTask extends Omit<SyncTaskSummary, 'id' | 'revision'> {

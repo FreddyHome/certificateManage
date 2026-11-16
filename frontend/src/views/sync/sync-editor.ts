@@ -8,6 +8,7 @@ import type {
   SyncStep,
   SyncTask,
 } from '../../services/sync-types';
+import { defaultSchedule } from './schedule-editor';
 
 export const parameterFields: ParameterField[] = ['headers', 'fields', 'query'];
 export const parameterLabels: Record<ParameterField, string> = {
@@ -49,6 +50,7 @@ export function createTask(): SyncTask {
     scheduleEnabled: false,
     cron: '0 0 2 * * *',
     timezone: 'Asia/Shanghai',
+    schedule: defaultSchedule(),
     steps: [],
   };
 }
@@ -136,6 +138,7 @@ export function parameterMaps(steps: SyncStep[]): ParameterMaps {
 
 export function taskPayload(task: SyncTask, maps: ParameterMaps): SyncTask {
   const payload: SyncTask = JSON.parse(JSON.stringify(task));
+  payload.scheduleEnabled = payload.state === 'READY';
   for (const step of payload.steps) {
     if (
       step.type === 'HTTP' &&

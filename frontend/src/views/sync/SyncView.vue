@@ -5,6 +5,7 @@ import SyncTaskEditor from './SyncTaskEditor.vue';
 import SyncRunHistory from './SyncRunHistory.vue';
 import SyncRunDetail from './SyncRunDetail.vue';
 import { syncStatus as status } from './sync-editor';
+import { formatScheduleTime } from './schedule-editor';
 import { useSyncTasks } from './useSyncTasks';
 
 const router = useRouter();
@@ -49,13 +50,22 @@ function viewAudit(id: number) {
       <el-table-column label="状态">
         <template #default="{ row }">{{ status(row.state) }}</template>
       </el-table-column>
-      <el-table-column prop="scheduleEnabled" label="定时启用" />
-      <el-table-column prop="cron" label="Cron" />
-      <el-table-column prop="timezone" label="时区" />
+      <el-table-column
+        prop="scheduleSummary"
+        label="执行计划"
+        min-width="240"
+        show-overflow-tooltip
+      />
       <el-table-column label="最近状态">
         <template #default="{ row }">{{ status(row.lastStatus) }}</template>
       </el-table-column>
-      <el-table-column prop="nextFireAt" label="下次执行" />
+      <el-table-column label="下次计划时间" min-width="210"
+        ><template #default="{ row }">{{
+          row.scheduleEnabled
+            ? formatScheduleTime(row.nextFireAt, row.timezone, row.schedule?.frequency === 'CUSTOM')
+            : '—'
+        }}</template></el-table-column
+      >
       <el-table-column label="操作" width="300">
         <template #default="{ row }">
           <el-button link @click="edit(row)">编辑</el-button>

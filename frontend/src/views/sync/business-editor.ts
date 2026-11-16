@@ -61,3 +61,29 @@ export function eligibleChains(
     )
     .sort((a, b) => Date.parse(b.notAfter || '') - Date.parse(a.notAfter || '') || b.id - a.id);
 }
+
+/** 自有私钥库以基准叶子CN精确匹配，每次预览采用到期最晚的可用链。 */
+export function eligibleOwnChains(
+  certs: SyncCertificate[],
+  referenceId: number | null | undefined,
+  referenceCn?: string,
+): SyncCertificate[] {
+  const reference = certs.find((c) => c.id === referenceId);
+  const cn = reference?.name || referenceCn;
+  if (!cn) return [];
+  const now = Date.now();
+  return certs
+    .filter(
+      (c) =>
+        c.owner === 'OWN' &&
+        c.kind === 'LEAF' &&
+        c.hasKey &&
+        c.name === cn &&
+        c.enabled !== false &&
+        c.chainAvailable !== false &&
+        !c.archivedAt &&
+        Date.parse(c.notBefore || '') <= now &&
+        Date.parse(c.notAfter || '') > now,
+    )
+    .sort((a, b) => Date.parse(b.notAfter || '') - Date.parse(a.notAfter || '') || b.id - a.id);
+}
