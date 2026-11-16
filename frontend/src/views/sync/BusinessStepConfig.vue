@@ -1,6 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
-import { request } from '../../api/client';
+import { computed, ref, watch, onScopeDispose } from 'vue';
+import {
+  certificateChain,
+  chainRevision,
+  useCertificateChainSession,
+} from '../../services/certificate-chain';
+useCertificateChainSession();
 import RequestParameters from '../../components/RequestParameters.vue';
 import { eligibleChains, eligibleOwnChains } from './business-editor';
 import { certificateLabel } from './sync-editor';
@@ -49,16 +54,22 @@ const nodes = ref<SyncChainNode[]>([]);
 const loading = ref(false);
 const chainError = ref('');
 let generation = 0;
+onScopeDispose(() => {
+  generation++;
+});
 watch(
-  selected,
-  async (id) => {
+  () => [selected.value, chainRevision.value] as const,
+  async ([id]) => {
     const current = ++generation;
     nodes.value = [];
     chainError.value = '';
-    if (!id) return;
+    if (!id) {
+      loading.value = false;
+      return;
+    }
     loading.value = true;
     try {
-      const chain = await request<SyncChainNode[]>(`/certificates/${id}/chain`);
+      const chain = await certificateChain(id);
       if (current !== generation) return;
       nodes.value = chain;
       if (

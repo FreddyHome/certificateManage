@@ -17,7 +17,10 @@ import org.springframework.transaction.annotation.Transactional;
  * @author Freddy
  * @date 2026-11-12
  */
-public class NotificationService {
+public class NotificationService implements com.certmanage.common.PerformanceSource {
+  private final Object scanLock = new Object();
+  private volatile long scanMillis, sendMillis, scanCount, sendBatches;
+  private volatile boolean scanning, sending;
   private final com.certmanage.common.ExecutionLog logs;
   private final JdbcTemplate db;
   private final SmtpService smtp;
@@ -140,7 +143,27 @@ public class NotificationService {
    * @return 新建投递数量
    * @throws RuntimeException 扫描或日志写入失败时传播
    */
-  public synchronized int scan() {
+  public int scan() {
+    synchronized (scanLock) {
+      long started = System.nanoTime();
+      scanning = true;
+      try {
+        return scanWithLogs();
+      } finally {
+        scanMillis = (System.nanoTime() - started) / 1_000_000;
+        scanCount++;
+        scanning = false;
+      }
+    }
+  }
+
+  /**
+   * @description 执行单轮扫描并记录结果，不与邮件投递共享监视器。
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 本轮新增投递数量
+   */
+  private int scanWithLogs() {
     logs.append(
         "NOTIFICATION",
         "SCAN_STARTED",
@@ -197,26 +220,28 @@ public class NotificationService {
     if (now.toLocalTime().isBefore(LocalTime.parse((String) p.get("scanTime")))) return 0;
     @SuppressWarnings("unchecked")
     List<Integer> thresholds = (List<Integer>) p.get("thresholds");
-    var recipients = db.queryForList("select * from notification_recipients");
     String filter = Boolean.TRUE.equals(p.get("includeCa")) ? "" : " and a.certificate_kind='LEAF'";
-    var certs =
-        db.queryForList(
-            "select a.id,a.purpose,m.common_name,m.not_after,c.customer_name from certificate_assets a join certificate_materials m on m.id=a.material_id left join customers c on c.id=a.customer_id where a.deleted_at is null and a.archived_at is null and a.enabled=true and m.not_after>current_timestamp"
-                + filter);
     int created = 0;
-    for (var c : certs) {
-      var expiry = ((OffsetDateTime) c.get("NOT_AFTER")).atZoneSameInstant(zone);
-      long days =
-          java.time.temporal.ChronoUnit.DAYS.between(now.toLocalDate(), expiry.toLocalDate());
-      if (!thresholds.contains((int) days)) continue;
-      for (var r : recipients) {
+    for (int days : thresholds) {
+      var range = expiryRange(now.toLocalDate(), days, zone);
+      var start = range[0];
+      var end = range[1];
+      var missing =
+          db.queryForList(
+              "select a.id,a.purpose,m.common_name,m.not_after,c.customer_name,r.email_address,r.email_key from certificate_assets a join certificate_materials m on m.id=a.material_id left join customers c on c.id=a.customer_id cross join notification_recipients r where r.policy_id=1 and a.deleted_at is null and a.archived_at is null and a.enabled=true and m.not_after>current_timestamp and m.not_after>=? and m.not_after<?"
+                  + filter
+                  + " and not exists(select 1 from notification_deliveries d where d.asset_id=a.id and d.not_after_snapshot=m.not_after and d.threshold_days=? and d.recipient_key=r.email_key)",
+              start,
+              end,
+              days);
+      for (var c : missing) {
         try {
           db.update(
               "insert into notification_deliveries(asset_id,policy_id,threshold_days,recipient_address,recipient_key,not_after_snapshot,cn_snapshot,customer_snapshot,purpose_snapshot,message_id) values(?,1,?,?,?,?,?,?,?,?)",
               c.get("ID"),
               days,
-              r.get("EMAIL_ADDRESS"),
-              r.get("EMAIL_KEY"),
+              c.get("EMAIL_ADDRESS"),
+              c.get("EMAIL_KEY"),
               c.get("NOT_AFTER"),
               c.get("COMMON_NAME"),
               c.get("CUSTOMER_NAME"),
@@ -224,6 +249,7 @@ public class NotificationService {
               "<" + UUID.randomUUID() + "@certmanage.local>");
           created++;
         } catch (DuplicateKeyException ignored) {
+          // 多实例同时扫描仍由数据库唯一键保证幂等。
         }
       }
     }
@@ -231,7 +257,24 @@ public class NotificationService {
   }
 
   /**
-   * @description 定时扫描及投递，后台异常时记录日志。
+   * @description 计算提醒目标本地日的半开区间，兼容夏令时短日与长日。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param today 策略时区的今天
+   * @param days 提前提醒天数
+   * @param zone 策略时区
+   * @return 目标日起点及次日起点
+   */
+  static OffsetDateTime[] expiryRange(LocalDate today, int days, ZoneId zone) {
+    var date = today.plusDays(days);
+    return new OffsetDateTime[] {
+      date.atStartOfDay(zone).toOffsetDateTime(),
+      date.plusDays(1).atStartOfDay(zone).toOffsetDateTime()
+    };
+  }
+
+  /**
+   * @description 定时扫描，独立于慢SMTP投递且后台异常时记录日志。
    * @author Freddy
    * @date 2026-11-12
    */
@@ -239,7 +282,6 @@ public class NotificationService {
   public void tick() {
     try {
       scan();
-      sendPending();
     } catch (Exception e) {
       logs.append(
           "NOTIFICATION",
@@ -257,11 +299,42 @@ public class NotificationService {
   }
 
   /**
+   * @description 独立调度邮件批次，避免慢SMTP阻塞证书扫描。
+   * @author Freddy
+   * @date 2026-11-16
+   */
+  @Scheduled(fixedDelay = 60000, initialDelay = 60000)
+  public void sendTick() {
+    try {
+      sendPending();
+    } catch (RuntimeException e) {
+      org.slf4j.LoggerFactory.getLogger(getClass()).warn("通知投递暂未完成，检查数据库及配置");
+    }
+  }
+
+  /**
    * @description 恢复过期租约并领取启用资产的待投递任务，保留原邮件标识和重试规则。
    * @author Freddy
    * @date 2026-11-12
    */
   public synchronized void sendPending() {
+    long started = System.nanoTime();
+    sending = true;
+    try {
+      sendBatchPending();
+    } finally {
+      sendMillis = (System.nanoTime() - started) / 1_000_000;
+      sendBatches++;
+      sending = false;
+    }
+  }
+
+  /**
+   * @description 投递最多二十条已领取任务，同批次使用一个惰性邮件会话。
+   * @author Freddy
+   * @date 2026-11-16
+   */
+  private void sendBatchPending() {
     for (long stale :
         db.queryForList(
             "select id from notification_deliveries where delivery_status='SENDING' and lease_until<current_timestamp",
@@ -284,63 +357,49 @@ public class NotificationService {
     var jobs =
         db.queryForList(
             "select d.*,a.owner_type from notification_deliveries d join certificate_assets a on a.id=d.asset_id where a.deleted_at is null and a.archived_at is null and a.enabled=true and delivery_status in('PENDING','RETRY_WAIT') and (next_attempt_at is null or next_attempt_at<=current_timestamp) order by d.id fetch first 20 rows only");
-    for (var j : jobs) {
-      long id = ((Number) j.get("ID")).longValue();
-      int attempt = ((Number) j.get("ATTEMPTS")).intValue() + 1;
-      String lease = UUID.randomUUID().toString();
-      int claimed =
-          db.update(
-              "update notification_deliveries set delivery_status='SENDING',attempts=?,lease_owner=?,lease_until=dateadd('MINUTE',5,current_timestamp) where id=? and delivery_status in('PENDING','RETRY_WAIT') and asset_id in(select id from certificate_assets where deleted_at is null and archived_at is null and enabled=true)",
-              attempt,
-              lease,
-              id);
-      if (claimed == 0) continue;
-      boolean accepted = false;
-      db.update(
-          "insert into notification_attempts(delivery_id,attempt_no,started_at,outcome) values(?,?,current_timestamp,'STARTED')",
-          id,
-          attempt);
-      try {
-        logs.append(
-            "NOTIFICATION",
-            "DELIVERY_STARTED",
-            "STARTED",
-            "notification-worker",
-            null,
-            null,
-            "DELIVERY",
-            id,
-            "通知投递开始",
-            Map.of("attempt", attempt));
-        smtp.send(
-            j.get("RECIPIENT_ADDRESS").toString(),
-            "证书到期提醒：" + j.get("CN_SNAPSHOT"),
-            mailBody(j, Instant.now(), ZoneId.of((String) get().get("timezone"))),
-            j.get("MESSAGE_ID").toString());
-        accepted = true;
+    SmtpService.Batch batch = null;
+    ZoneId mailZone = null;
+    try {
+      for (var j : jobs) {
+        long id = ((Number) j.get("ID")).longValue();
+        int attempt = ((Number) j.get("ATTEMPTS")).intValue() + 1;
+        String lease = UUID.randomUUID().toString();
+        int claimed =
+            db.update(
+                "update notification_deliveries set delivery_status='SENDING',attempts=?,lease_owner=?,lease_until=dateadd('MINUTE',5,current_timestamp) where id=? and delivery_status in('PENDING','RETRY_WAIT') and asset_id in(select id from certificate_assets where deleted_at is null and archived_at is null and enabled=true)",
+                attempt,
+                lease,
+                id);
+        if (claimed == 0) continue;
+        if (mailZone == null) {
+          mailZone = ZoneId.of((String) get().get("timezone"));
+          batch = smtp.beginBatch();
+        }
+        boolean accepted = false;
         db.update(
-            "update notification_deliveries set delivery_status='SENT',sent_at=current_timestamp,error_message=null,lease_until=null where id=? and lease_owner=?",
-            id,
-            lease);
-        db.update(
-            "update notification_attempts set outcome='SUCCESS',finished_at=current_timestamp where delivery_id=? and attempt_no=?",
+            "insert into notification_attempts(delivery_id,attempt_no,started_at,outcome) values(?,?,current_timestamp,'STARTED')",
             id,
             attempt);
-        logs.appendAfterEffect(
-            "NOTIFICATION",
-            "DELIVERY_SUCCESS",
-            "SUCCESS",
-            "notification-worker",
-            null,
-            null,
-            "DELIVERY",
-            id,
-            "通知投递成功",
-            Map.of("attempt", attempt));
-      } catch (Exception e) {
-        if (accepted) {
+        try {
+          logs.append(
+              "NOTIFICATION",
+              "DELIVERY_STARTED",
+              "STARTED",
+              "notification-worker",
+              null,
+              null,
+              "DELIVERY",
+              id,
+              "通知投递开始",
+              Map.of("attempt", attempt));
+          smtp.send(
+              j.get("RECIPIENT_ADDRESS").toString(),
+              "证书到期提醒：" + j.get("CN_SNAPSHOT"),
+              mailBody(j, Instant.now(), mailZone),
+              j.get("MESSAGE_ID").toString());
+          accepted = true;
           db.update(
-              "update notification_deliveries set delivery_status='SENT',sent_at=coalesce(sent_at,current_timestamp),error_message=null,lease_until=null where id=? and lease_owner=?",
+              "update notification_deliveries set delivery_status='SENT',sent_at=current_timestamp,error_message=null,lease_until=null where id=? and lease_owner=?",
               id,
               lease);
           db.update(
@@ -356,31 +415,55 @@ public class NotificationService {
               null,
               "DELIVERY",
               id,
-              "邮件已确认接受，已恢复成功结果",
+              "通知投递成功",
               Map.of("attempt", attempt));
-          continue;
+        } catch (Exception e) {
+          if (accepted) {
+            db.update(
+                "update notification_deliveries set delivery_status='SENT',sent_at=coalesce(sent_at,current_timestamp),error_message=null,lease_until=null where id=? and lease_owner=?",
+                id,
+                lease);
+            db.update(
+                "update notification_attempts set outcome='SUCCESS',finished_at=current_timestamp where delivery_id=? and attempt_no=?",
+                id,
+                attempt);
+            logs.appendAfterEffect(
+                "NOTIFICATION",
+                "DELIVERY_SUCCESS",
+                "SUCCESS",
+                "notification-worker",
+                null,
+                null,
+                "DELIVERY",
+                id,
+                "邮件已确认接受，已恢复成功结果",
+                Map.of("attempt", attempt));
+            continue;
+          }
+          db.update(
+              "update notification_deliveries set delivery_status=?,next_attempt_at=dateadd('MINUTE',15,current_timestamp),error_message='SMTP发送失败，请检查连接、TLS及凭据',lease_until=null where id=? and lease_owner=?",
+              attempt >= 3 ? "FAILED" : "RETRY_WAIT",
+              id,
+              lease);
+          db.update(
+              "update notification_attempts set outcome='FAILURE',finished_at=current_timestamp,error_message='SMTP发送失败' where delivery_id=? and attempt_no=?",
+              id,
+              attempt);
+          logs.append(
+              "NOTIFICATION",
+              "DELIVERY_FAILURE",
+              "FAILURE",
+              "notification-worker",
+              null,
+              null,
+              "DELIVERY",
+              id,
+              "通知投递失败",
+              Map.of("attempt", attempt));
         }
-        db.update(
-            "update notification_deliveries set delivery_status=?,next_attempt_at=dateadd('MINUTE',15,current_timestamp),error_message='SMTP发送失败，请检查连接、TLS及凭据',lease_until=null where id=? and lease_owner=?",
-            attempt >= 3 ? "FAILED" : "RETRY_WAIT",
-            id,
-            lease);
-        db.update(
-            "update notification_attempts set outcome='FAILURE',finished_at=current_timestamp,error_message='SMTP发送失败' where delivery_id=? and attempt_no=?",
-            id,
-            attempt);
-        logs.append(
-            "NOTIFICATION",
-            "DELIVERY_FAILURE",
-            "FAILURE",
-            "notification-worker",
-            null,
-            null,
-            "DELIVERY",
-            id,
-            "通知投递失败",
-            Map.of("attempt", attempt));
       }
+    } finally {
+      if (batch != null) batch.close();
     }
   }
 
@@ -451,5 +534,37 @@ public class NotificationService {
         id,
         "通知已重新入队",
         Map.of());
+  }
+
+  /**
+   * @description 返回固定通知指标分组。
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 通知分组名
+   */
+  public String performanceName() {
+    return "notifications";
+  }
+
+  /**
+   * @description 返回内存聚合的扫描和发送指标，不额外查询数据库。
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 耗时、次数和运行状态
+   */
+  public Map<String, Object> performanceSnapshot() {
+    return Map.of(
+        "scanMillis",
+        scanMillis,
+        "sendMillis",
+        sendMillis,
+        "scanCount",
+        scanCount,
+        "sendBatches",
+        sendBatches,
+        "scanning",
+        scanning,
+        "sending",
+        sending);
   }
 }

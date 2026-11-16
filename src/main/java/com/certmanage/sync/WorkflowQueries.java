@@ -79,7 +79,7 @@ class WorkflowQueries {
    */
   public List<Map<String, Object>> list() {
     return db.query(
-        "select t.*, r.status as last_status from sync_tasks t left join sync_runs r on r.id=(select max(latest.id) from sync_runs latest where latest.task_id=t.id) where t.deleted_at is null order by t.id desc",
+        "select t.id,t.name,t.description,t.config_revision,t.state,t.schedule_enabled,t.cron,t.timezone,t.schedule_json,t.next_fire_at, r.status as last_status from sync_tasks t left join sync_runs r on r.id=(select max(latest.id) from sync_runs latest where latest.task_id=t.id) where t.deleted_at is null order by t.id desc",
         (r, n) -> {
           var task = taskRow(r, n);
           task.put("lastStatus", r.getString("last_status"));
@@ -97,13 +97,16 @@ class WorkflowQueries {
    */
   Map<String, Object> stored(long id) {
     var rows =
-        db.query("select * from sync_tasks where id=? and deleted_at is null", this::taskRow, id);
+        db.query(
+            "select id,name,description,config_revision,state,schedule_enabled,cron,timezone,schedule_json,next_fire_at from sync_tasks where id=? and deleted_at is null",
+            this::taskRow,
+            id);
     require(!rows.isEmpty(), "同步任务不存在");
     var task = rows.getFirst();
     task.put(
         "steps",
         db.query(
-            "select * from sync_task_steps where task_id=? order by position",
+            "select step_key,name,component_type,config_json,secret_bundle_id from sync_task_steps where task_id=? order by position",
             (r, n) -> {
               var step = new LinkedHashMap<String, Object>();
               step.put("key", r.getString("step_key"));
@@ -156,9 +159,13 @@ class WorkflowQueries {
    * @throws IllegalArgumentException 任务不存在或已删除时抛出
    */
   public List<Map<String, Object>> runs(long task) {
-    stored(task);
+    require(
+        !db.queryForList(
+                "select id from sync_tasks where id=? and deleted_at is null", Long.class, task)
+            .isEmpty(),
+        "同步任务不存在");
     return db.query(
-        "select * from sync_runs where task_id=? order by id desc fetch first 200 rows only",
+        "select id,task_id,status,trigger_type,task_revision,error_summary,created_at,started_at,finished_at from sync_runs where task_id=? order by id desc fetch first 200 rows only",
         this::runRow,
         task);
   }
@@ -202,13 +209,17 @@ class WorkflowQueries {
    * @throws IllegalArgumentException 执行记录不存在时抛出
    */
   public Map<String, Object> runDetail(long id) {
-    var rows = db.query("select * from sync_runs where id=?", this::runRow, id);
+    var rows =
+        db.query(
+            "select id,task_id,status,trigger_type,task_revision,error_summary,created_at,started_at,finished_at from sync_runs where id=?",
+            this::runRow,
+            id);
     require(!rows.isEmpty(), "执行记录不存在");
     var run = rows.getFirst();
     run.put(
         "steps",
         db.query(
-            "select * from sync_run_steps where run_id=? order by position",
+            "select step_key,name,component_type,status,error_summary,result_json,started_at,finished_at from sync_run_steps where run_id=? order by position",
             (r, n) -> {
               var m = new LinkedHashMap<String, Object>();
               m.put("key", r.getString("step_key"));

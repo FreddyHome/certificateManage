@@ -41,6 +41,7 @@ public class RawLogContextFilter extends OncePerRequestFilter {
     String path = request.getRequestURI();
     return !path.startsWith("/api/v1/")
         || path.startsWith("/api/v1/execution-logs")
+        || path.equals("/api/v1/system/performance")
         || path.equals("/api/v1/auth/me")
         || path.equals("/api/v1/auth/csrf");
   }

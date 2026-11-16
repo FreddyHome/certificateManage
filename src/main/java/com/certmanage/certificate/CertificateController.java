@@ -57,6 +57,42 @@ public class CertificateController {
   }
 
   /**
+   * @description 查询普通或归档证书分页摘要，保留旧全量接口契约
+   * @author Freddy
+   * @date 2026-11-16
+   * @param owner 归属，普通默认OWN，归档可空
+   * @param kind 可选证书层级
+   * @param query CN或客户包含搜索
+   * @param purpose 可选用途
+   * @param status 可选有效期状态
+   * @param page 从1开始的页码
+   * @param size 每页1至100条
+   * @param request 用于识别普通与归档范围的当前请求
+   * @return 当前页条目、总数及分页参数
+   * @throws IllegalArgumentException 筛选或分页参数不合法
+   */
+  @GetMapping({"/certificates/page", "/certificates/archived/page"})
+  public Object page(
+      @RequestParam(required = false) String owner,
+      @RequestParam(required = false) String kind,
+      @RequestParam(required = false) String query,
+      @RequestParam(required = false) String purpose,
+      @RequestParam(required = false) String status,
+      @RequestParam(defaultValue = "1") int page,
+      @RequestParam(defaultValue = "20") int size,
+      jakarta.servlet.http.HttpServletRequest request) {
+    return service.page(
+        owner,
+        kind,
+        query,
+        purpose,
+        status,
+        page,
+        size,
+        request.getRequestURI().endsWith("/certificates/archived/page"));
+  }
+
+  /**
    * @description 按可选归属查询归档证书
    * @author Freddy
    * @date 2026-11-12

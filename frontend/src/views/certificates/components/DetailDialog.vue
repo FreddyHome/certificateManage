@@ -1,23 +1,43 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, onScopeDispose } from 'vue';
 import { request } from '../../../api/client';
 import { run } from '../../../composables/useAsyncAction';
+import {
+  certificateChain,
+  chainRevision,
+  useCertificateChainSession,
+} from '../../../services/certificate-chain';
+useCertificateChainSession();
 import { date } from '../../../utils/format';
 const props = defineProps<{ id?: number }>();
 const emit = defineEmits(['closed']);
 const detail = ref<any>(),
   chain = ref<any[]>([]),
   selected = ref<any>();
+let generation = 0;
+onScopeDispose(() => {
+  generation++;
+});
 watch(
-  () => props.id,
-  (id) => {
+  () => [props.id, chainRevision.value] as const,
+  ([id]) => {
+    const current = ++generation;
+    detail.value = undefined;
+    chain.value = [];
+    selected.value = undefined;
     if (id)
       run(async () => {
-        detail.value = await request('/certificates/' + id);
-        chain.value = await request('/certificates/' + id + '/chain');
-        selected.value = chain.value.at(-1);
+        const [nextDetail, nextChain] = await Promise.all([
+          request('/certificates/' + id),
+          certificateChain(id),
+        ]);
+        if (current !== generation) return;
+        detail.value = nextDetail;
+        chain.value = nextChain;
+        selected.value = nextChain.at(-1);
       });
   },
+  { immediate: true },
 );
 </script>
 <template>

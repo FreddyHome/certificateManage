@@ -20,7 +20,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * @author Freddy
  * @date 2026-11-12
  */
-public class WorkflowRunner {
+public class WorkflowRunner implements com.certmanage.common.PerformanceSource {
+  @org.springframework.beans.factory.annotation.Value("${app.sync.parallelism:2}")
+  private int parallelism = 2;
+
   private final JdbcTemplate db;
   private final BusinessComponents business;
   private final com.certmanage.common.RawExecutionLog raw;
@@ -87,9 +90,9 @@ public class WorkflowRunner {
   public void runNext() {
     var ids =
         db.queryForList(
-            "select id from sync_runs where status='QUEUED' order by id fetch first 1 row only",
+            "select id from sync_runs where status='QUEUED' order by id fetch first 100 rows only",
             Long.class);
-    if (!ids.isEmpty()) executeRun(ids.getFirst());
+    for (long id : ids) if (executeClaimed(id)) return;
   }
 
   /**
@@ -99,18 +102,40 @@ public class WorkflowRunner {
    * @param id 记录标识
    */
   public void executeRun(long id) {
+    executeClaimed(id);
+  }
+
+  /**
+   * @description 在全局锁内领取无任务和服务器冲突的执行，远端操作始终位于事务外。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param id 执行主键
+   * @return 本次是否领取并执行
+   */
+  private boolean executeClaimed(long id) {
     String owner = UUID.randomUUID().toString();
     Boolean claimed =
         tx.execute(
             s -> {
               workflows.lock();
+              int running =
+                  db.queryForObject(
+                      "select count(*) from sync_runs where status='RUNNING'", Integer.class);
+              if (running >= Math.max(1, parallelism)) return false;
+              int conflicts =
+                  db.queryForObject(
+                      "select count(*) from sync_runs r where r.status='RUNNING' and (r.task_id=(select task_id from sync_runs where id=?) or exists(select 1 from sync_run_servers occupied join sync_run_servers target on target.server_id=occupied.server_id where occupied.run_id=r.id and target.run_id=?))",
+                      Integer.class,
+                      id,
+                      id);
+              if (conflicts > 0) return false;
               return db.update(
                       "update sync_runs set status='RUNNING',started_at=current_timestamp,lease_owner=?,lease_until=dateadd('MINUTE',5,current_timestamp) where id=? and status='QUEUED'",
                       owner,
                       id)
                   == 1;
             });
-    if (!Boolean.TRUE.equals(claimed)) return;
+    if (!Boolean.TRUE.equals(claimed)) return false;
     active.put(id, owner);
     String current = null;
     String currentDescription = "";
@@ -119,7 +144,12 @@ public class WorkflowRunner {
     var files = new HashMap<String, Artifact>();
     long totalBytes = 0;
     var rawScope = raw.begin();
-    try {
+    try (var scope = certs.materialScope()) {
+      var referencedAssets =
+          db.queryForList(
+              "select distinct source_asset_id from sync_run_certificates where run_id=?",
+              Long.class,
+              id);
       var snapshot =
           workflows.decode(
               db.queryForObject(
@@ -175,16 +205,9 @@ public class WorkflowRunner {
             Map.of());
         heartbeat();
         // 同时校验输入证书与服务器信任证书，已排队任务不绕过后续的禁用操作。
-        for (long referencedAsset :
-            db.queryForList(
-                "select distinct source_asset_id from sync_run_certificates where run_id=?",
-                Long.class,
-                id)) {
-          certs.requireEnabled(referencedAsset);
-        }
+        certs.requireEnabled(referencedAssets);
 
         for (var ref : maps(c.get("references"))) {
-          certs.requireEnabled(id(ref, "assetId"));
           certs.material(id(ref, "materialId")).checkValidity();
         }
         Map<String, Object> result;
@@ -417,6 +440,7 @@ public class WorkflowRunner {
         rawScope.close();
       }
     }
+    return true;
   }
 
   /**
@@ -515,6 +539,26 @@ public class WorkflowRunner {
         "insert into audit_events(actor_name,action_code,target_type,target_id,outcome) values('sync-worker','SYNC_EXECUTION','SYNC_RUN',?,?)",
         Long.toString(run),
         outcome);
+  }
+
+  /**
+   * @description 提供不包含业务目标的工作流聚合指标。
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 聚合指标名称
+   */
+  public String performanceName() {
+    return "workflow";
+  }
+
+  /**
+   * @description 统计当前执行数与并行容量，不访问数据库；目标占用由缓存队列指标提供。
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 不含秘密和服务器编号的指标
+   */
+  public Map<String, Object> performanceSnapshot() {
+    return Map.of("active", active.size(), "capacity", Math.max(1, parallelism));
   }
 
   private record Artifact(byte[] bytes, String filename) {}

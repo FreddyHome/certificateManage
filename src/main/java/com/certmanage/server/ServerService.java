@@ -89,27 +89,44 @@ public class ServerService {
    * @return 内部连接配置，包含解密凭据
    */
   public Map<String, Object> connection(long id) {
-    return db.queryForObject(
-        "select public_config_json,secret_bundle_id from managed_server_configs where id=?",
-        (r, n) -> {
-          try {
-            Map<String, Object> m =
-                json.readValue(
-                    r.getString(1),
-                    new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
-            m.putAll(secrets.read(r.getObject(2, Long.class)));
-            m.put(
-                "_trustMaterialIds",
-                db.queryForList(
-                    "select material_id from managed_server_trust_certificates where server_config_id=?",
-                    Long.class,
-                    id));
-            return m;
-          } catch (Exception e) {
-            throw new IllegalStateException(e);
-          }
-        },
-        id);
+    return loadConnection(id, true);
+  }
+
+  /**
+   * @description 读取连接秘密；运行时实时检查信任资产，编辑旧版本时允许替换失效引用。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param id 配置版本主键
+   * @param checkTrust 是否执行运行前信任资产检查
+   * @return 不含内部凭据标记的连接配置
+   */
+  private Map<String, Object> loadConnection(long id, boolean checkTrust) {
+    var row =
+        db.queryForMap(
+            "select public_config_json,secret_bundle_id from managed_server_configs where id=?",
+            id);
+    var config = decodePublic(row.get("PUBLIC_CONFIG_JSON"));
+    config.remove("_credentialFlags");
+    config.putAll(
+        secrets.read(
+            row.get("SECRET_BUNDLE_ID") == null
+                ? null
+                : ((Number) row.get("SECRET_BUNDLE_ID")).longValue()));
+    if (checkTrust)
+      Errors.require(
+          db.queryForObject(
+                  "select count(*) from managed_server_trust_certificates t join certificate_assets a on a.id=t.source_asset_id where t.server_config_id=? and (a.enabled=false or a.archived_at is not null or a.deleted_at is not null)",
+                  Integer.class,
+                  id)
+              == 0,
+          "信任证书已停用或归档");
+    config.put(
+        "_trustMaterialIds",
+        db.queryForList(
+            "select material_id from managed_server_trust_certificates where server_config_id=?",
+            Long.class,
+            id));
+    return config;
   }
 
   /**
@@ -120,42 +137,131 @@ public class ServerService {
    * @return 去除秘密明文的管理响应
    */
   public Map<String, Object> get(long id) {
-    var r = row(id);
-    var c = connection(((Number) r.get("CURRENT_CONFIG_ID")).longValue());
-    c.remove("_trustMaterialIds");
-    for (String s : SECRET) {
-      Object v = c.remove(s);
-      c.put(s + "Configured", v != null && !v.toString().isBlank());
-    }
-    return Map.of(
-        "id",
-        id,
-        "alias",
-        r.get("ALIAS"),
-        "type",
-        r.get("TYPE"),
-        "description",
-        Objects.toString(r.get("DESCRIPTION"), ""),
-        "enabled",
-        r.get("ENABLED"),
-        "revision",
-        r.get("CONFIG_REVISION"),
-        "config",
-        c);
+    var rows = summaryRows(" and s.id=?", id);
+    if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    return summaries(rows).getFirst();
   }
 
   /**
-   * @description 按服务器ID顺序返回去除秘密的管理列表
+   * @description 一次联表读取全部服务器摘要，旧版本仅首次补全凭据标记。
    * @author Freddy
-   * @date 2026-11-12
-   * @return 服务器管理列表
+   * @date 2026-11-16
+   * @return 不包含秘密和内部标记的服务器列表
    */
   public List<Map<String, Object>> list() {
-    return db
-        .queryForList("select id from managed_servers where deleted_at is null order by id")
-        .stream()
-        .map(r -> get(((Number) r.get("ID")).longValue()))
-        .toList();
+    return summaries(summaryRows(""));
+  }
+
+  /**
+   * @description 查询服务器及其当前公开配置，不在行映射中开启第二连接。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param filter 受控的附加条件
+   * @param args 条件参数
+   * @return 服务器与当前配置记录
+   */
+  private List<Map<String, Object>> summaryRows(String filter, Object... args) {
+    return db.queryForList(
+        "select s.id,s.alias,s.type,s.description,s.enabled,s.config_revision,c.id as config_id,c.public_config_json,c.secret_bundle_id from managed_servers s join managed_server_configs c on c.id=s.current_config_id where s.deleted_at is null"
+            + filter
+            + " order by s.id",
+        args);
+  }
+
+  /**
+   * @description 解析公开配置，统一处理数据库大文本类型。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param value 数据库中的JSON文本或大文本
+   * @return 可修改的公开配置
+   */
+  private Map<String, Object> decodePublic(Object value) {
+    try {
+      String text =
+          value instanceof java.sql.Clob clob
+              ? clob.getSubString(1, Math.toIntExact(clob.length()))
+              : value.toString();
+      return json.readValue(
+          text, new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
+    } catch (Exception e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  /**
+   * @description 将真实凭据存在性生成非秘密标记，客户端提供的同名字段不会被信任。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param secret 服务端真实秘密配置
+   * @return 各秘密字段是否配置
+   */
+  private Map<String, Object> credentialFlags(Map<String, Object> secret) {
+    var flags = new LinkedHashMap<String, Object>();
+    for (String name : SECRET)
+      flags.put(
+          name + "Configured", secret.get(name) != null && !secret.get(name).toString().isBlank());
+    return flags;
+  }
+
+  /**
+   * @description 批量补全旧配置的非秘密标记并构建管理响应，正常列表只执行一次查询。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param rows 已读取的摘要记录
+   * @return 移除内部元数据及秘密的管理响应
+   */
+  private List<Map<String, Object>> summaries(List<Map<String, Object>> rows) {
+    var missing =
+        rows.stream()
+            .filter(r -> !decodePublic(r.get("PUBLIC_CONFIG_JSON")).containsKey("_credentialFlags"))
+            .toList();
+    var ids =
+        missing.stream()
+            .filter(r -> r.get("SECRET_BUNDLE_ID") != null)
+            .map(r -> ((Number) r.get("SECRET_BUNDLE_ID")).longValue())
+            .toList();
+    var legacy = ids.isEmpty() ? Map.<Long, Map<String, Object>>of() : secrets.readBatch(ids);
+    var updates = new ArrayList<Object[]>();
+    var result = new ArrayList<Map<String, Object>>();
+    for (var row : rows) {
+      var config = decodePublic(row.get("PUBLIC_CONFIG_JSON"));
+      if (!config.containsKey("_credentialFlags")) {
+        Long bundle =
+            row.get("SECRET_BUNDLE_ID") == null
+                ? null
+                : ((Number) row.get("SECRET_BUNDLE_ID")).longValue();
+        config.put(
+            "_credentialFlags",
+            credentialFlags(bundle == null ? Map.of() : legacy.getOrDefault(bundle, Map.of())));
+        try {
+          updates.add(new Object[] {json.writeValueAsString(config), row.get("CONFIG_ID")});
+        } catch (Exception e) {
+          throw new IllegalStateException(e);
+        }
+      }
+      var flags = (Map<String, Object>) config.remove("_credentialFlags");
+      for (String name : SECRET) config.remove(name);
+      config.putAll(flags);
+      result.add(
+          Map.of(
+              "id",
+              row.get("ID"),
+              "alias",
+              row.get("ALIAS"),
+              "type",
+              row.get("TYPE"),
+              "description",
+              Objects.toString(row.get("DESCRIPTION"), ""),
+              "enabled",
+              row.get("ENABLED"),
+              "revision",
+              row.get("CONFIG_REVISION"),
+              "config",
+              config));
+    }
+    if (!updates.isEmpty())
+      db.batchUpdate("update managed_server_configs set public_config_json=? where id=?", updates);
+    return result;
   }
 
   /**
@@ -192,7 +298,7 @@ public class ServerService {
         throw new ResponseStatusException(HttpStatus.CONFLICT, "配置已修改");
       if (!type.equals(r.get("TYPE")))
         throw new ResponseStatusException(HttpStatus.CONFLICT, "不可变更协议");
-      previous = connection(((Number) r.get("CURRENT_CONFIG_ID")).longValue());
+      previous = loadConnection(((Number) r.get("CURRENT_CONFIG_ID")).longValue(), false);
     } else {
       db.update(
           "insert into managed_servers(alias,alias_key,type,description,enabled,config_revision) values(?,?,?,?,?,1)",
@@ -220,11 +326,13 @@ public class ServerService {
       c.remove(clear.toString());
     }
     c.remove("clearSecrets");
+    c.keySet().removeIf(key -> key.startsWith("_"));
     c.put("type", type);
     validate(c);
     Map<String, Object> secret = new LinkedHashMap<>();
     for (String s : SECRET) if (c.containsKey(s)) secret.put(s, c.remove(s));
     long bundle = secrets.save(secret);
+    c.put("_credentialFlags", credentialFlags(secret));
     try {
       db.update(
           "insert into managed_server_configs(server_id,revision,public_config_json,secret_bundle_id) values(?,?,?,?)",

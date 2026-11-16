@@ -61,17 +61,77 @@ public class CertificateService {
    * @return 解析完成的 X.509 证书
    */
   public X509Certificate material(long id) {
+    var cache = publicMaterials.get();
+    if (cache != null && cache.containsKey(id)) return cache.get(id);
+    var cert =
+        parseMaterial(
+            db.queryForObject(
+                "select certificate_der from certificate_materials where id=?", byte[].class, id));
+    if (cache != null) cache.put(id, cert);
+    return cert;
+  }
+
+  /**
+   * @description 解析公钥材料，统一保留旧错误语义。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param der 公钥DER编码
+   * @return 解析后的证书
+   */
+  private X509Certificate parseMaterial(byte[] der) {
     try {
       return (X509Certificate)
           CertificateFactory.getInstance("X.509")
-              .generateCertificate(
-                  new java.io.ByteArrayInputStream(
-                      db.queryForObject(
-                          "select certificate_der from certificate_materials where id=?",
-                          byte[].class,
-                          id)));
+              .generateCertificate(new java.io.ByteArrayInputStream(der));
     } catch (Exception e) {
       throw new IllegalArgumentException("证书不存在或无法读取");
+    }
+  }
+
+  private final ThreadLocal<Map<Long, X509Certificate>> publicMaterials = new ThreadLocal<>();
+  private final ThreadLocal<Map<Long, List<X509Certificate>>> publicChains = new ThreadLocal<>();
+
+  /**
+   * @description 打开调用内公钥复用范围，不缓存私钥或资产启用状态。
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 结束时清除当前范围公钥的句柄，支持嵌套调用
+   */
+  public MaterialScope materialScope() {
+    return new MaterialScope();
+  }
+
+  /**
+   * @description 管理单线程调用内公钥缓存的生命周期，避免跨请求保留。
+   * @author Freddy
+   * @date 2026-11-16
+   */
+  public final class MaterialScope implements AutoCloseable {
+    private final boolean owner;
+
+    /**
+     * @description 仅最外层调用创建缓存。
+     * @author Freddy
+     * @date 2026-11-16
+     */
+    private MaterialScope() {
+      owner = publicMaterials.get() == null;
+      if (owner) {
+        publicMaterials.set(new HashMap<>());
+        publicChains.set(new HashMap<>());
+      }
+    }
+
+    /**
+     * @description 释放当前调用持有的公钥引用。
+     * @author Freddy
+     * @date 2026-11-16
+     */
+    public void close() {
+      if (owner) {
+        publicMaterials.remove();
+        publicChains.remove();
+      }
     }
   }
 
@@ -370,11 +430,12 @@ public class CertificateService {
    * @author Freddy
    * @date 2026-11-12
    * @param r 证书联合查询结果行
-   * @param n 查询结果的零基行序号
+   * @param warning 本次请求读取的预警天数
+   * @param now 本次请求使用的统一时间
    * @return 符合现有响应字段的证书详情
    * @throws SQLException 查询行字段读取失败时抛出
    */
-  private Map<String, Object> dto(ResultSet r, int n) throws SQLException {
+  private Map<String, Object> dto(ResultSet r, int warning, Instant now) throws SQLException {
     var m = new LinkedHashMap<String, Object>();
     m.put("id", r.getLong("id"));
     m.put("name", r.getString("common_name"));
@@ -390,19 +451,10 @@ public class CertificateService {
     m.put("depth", r.getObject("chain_depth"));
     m.put("issuer", r.getString("issuer_name"));
     Instant start = r.getObject("not_before", OffsetDateTime.class).toInstant(),
-        end = r.getObject("not_after", OffsetDateTime.class).toInstant(),
-        now = Instant.now();
-    int warning =
-        db.queryForObject("select warning_days from notification_policy where id=1", Integer.class);
+        end = r.getObject("not_after", OffsetDateTime.class).toInstant();
     m.put("notBefore", start.toString());
     m.put("notAfter", end.toString());
-    m.put(
-        "status",
-        now.isBefore(start)
-            ? "未生效"
-            : !now.isBefore(end)
-                ? "已过期"
-                : now.plusSeconds(warning * 86400L).isAfter(end) ? "即将过期" : "有效");
+    m.put("status", CertificatePageQuery.validityStatus(start, end, now, warning));
     m.put("hasKey", r.getBoolean("has_key"));
     m.put("subject", r.getString("subject_dn"));
     m.put("issuerDn", r.getString("issuer_dn"));
@@ -423,10 +475,12 @@ public class CertificateService {
    */
   public List<Map<String, Object>> list(String owner) {
     require(Set.of("OWN", "CUSTOMER").contains(owner), "归属错误");
+    int warning = warningDays();
+    Instant now = Instant.now();
     return db.query(
         SELECT
             + "where a.deleted_at is null and a.archived_at is null and a.owner_type=? order by m.not_after,a.id",
-        this::dto,
+        (r, n) -> dto(r, warning, now),
         owner);
   }
 
@@ -440,9 +494,54 @@ public class CertificateService {
    */
   public List<Map<String, Object>> archived(String owner) {
     require(owner == null || Set.of("OWN", "CUSTOMER").contains(owner), "归属错误");
+    int warning = warningDays();
+    Instant now = Instant.now();
     String sql = SELECT + "where a.deleted_at is null and a.archived_at is not null";
-    if (owner == null) return db.query(sql + " order by a.archived_at desc,a.id", this::dto);
-    return db.query(sql + " and a.owner_type=? order by a.archived_at desc,a.id", this::dto, owner);
+    if (owner == null)
+      return db.query(sql + " order by a.archived_at desc,a.id", (r, n) -> dto(r, warning, now));
+    return db.query(
+        sql + " and a.owner_type=? order by a.archived_at desc,a.id",
+        (r, n) -> dto(r, warning, now),
+        owner);
+  }
+
+  /**
+   * @description 在打开结果集前读取策略，避免逐行查询和额外连接争用
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 当前预警天数
+   */
+  private int warningDays() {
+    return db.queryForObject(
+        "select warning_days from notification_policy where id=1", Integer.class);
+  }
+
+  /**
+   * @description 按筛选范围分页返回证书摘要，保留旧全量查询供既有组件使用
+   * @author Freddy
+   * @date 2026-11-16
+   * @param owner 可选归属，普通列表默认OWN
+   * @param kind 可选层级
+   * @param query CN与客户包含查询
+   * @param purpose 可选业务用途
+   * @param status 可选有效期状态
+   * @param page 从1开始的页码
+   * @param size 每页1至100条
+   * @param archived 是否只查归档资产
+   * @return 条目、总数及分页参数
+   * @throws IllegalArgumentException 筛选或分页参数不合法
+   */
+  public Map<String, Object> page(
+      String owner,
+      String kind,
+      String query,
+      String purpose,
+      String status,
+      int page,
+      int size,
+      boolean archived) {
+    return new CertificatePageQuery(db)
+        .page(owner, kind, query, purpose, status, page, size, archived);
   }
 
   /**
@@ -502,7 +601,11 @@ public class CertificateService {
    * @return 证书详情
    */
   public Map<String, Object> detail(long id) {
-    var rows = db.query(SELECT + "where a.deleted_at is null and a.id=?", this::dto, id);
+    int warning = warningDays();
+    Instant now = Instant.now();
+    var rows =
+        db.query(
+            SELECT + "where a.deleted_at is null and a.id=?", (r, n) -> dto(r, warning, now), id);
     require(!rows.isEmpty(), "证书不存在");
     return rows.getFirst();
   }
@@ -520,6 +623,26 @@ public class CertificateService {
     require(asset.get("archivedAt") == null, "证书已归档，不能用于业务操作");
     require(Boolean.TRUE.equals(asset.get("enabled")), "证书已禁用，不能用于业务操作");
     return asset;
+  }
+
+  /**
+   * @description 每步骤批量实时校验引用资产状态，不复用启用或归档状态。
+   * @author Freddy
+   * @date 2026-11-16
+   * @param ids 冻结执行引用的资产编号
+   * @throws IllegalArgumentException 任一资产已停用、归档或删除
+   */
+  public void requireEnabled(Collection<Long> ids) {
+    if (ids.isEmpty()) return;
+    var unique = new LinkedHashSet<>(ids);
+    int enabled =
+        db.queryForObject(
+            "select count(*) from certificate_assets where id in ("
+                + String.join(",", Collections.nCopies(unique.size(), "?"))
+                + ") and enabled=true and archived_at is null and deleted_at is null",
+            Integer.class,
+            unique.toArray());
+    require(enabled == unique.size(), "证书不存在、已归档或已禁用，不能用于业务操作");
   }
 
   /**
@@ -595,14 +718,24 @@ public class CertificateService {
    * @return 按根到终端排列的公钥证书
    */
   public List<X509Certificate> chainCertificates(long id) {
-    return db
-        .queryForList(
-            "select material_id from asset_chain_nodes where asset_id=? order by node_position",
-            Long.class,
-            id)
-        .stream()
-        .map(this::material)
-        .toList();
+    var chains = publicChains.get();
+    if (chains != null && chains.containsKey(id)) return chains.get(id);
+    var materials = publicMaterials.get();
+    var chain =
+        List.copyOf(
+            db.query(
+                "select m.id,m.certificate_der from asset_chain_nodes n join certificate_materials m on m.id=n.material_id where n.asset_id=? order by n.node_position",
+                (r, n) -> {
+                  long material = r.getLong(1);
+                  if (materials != null && materials.containsKey(material))
+                    return materials.get(material);
+                  var cert = parseMaterial(r.getBytes(2));
+                  if (materials != null) materials.put(material, cert);
+                  return cert;
+                },
+                id));
+    if (chains != null) chains.put(id, chain);
+    return chain;
   }
 
   /**

@@ -3,13 +3,14 @@ import { ref, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessageBox, ElMessage } from 'element-plus';
 import { request } from '../api/client';
+import { getSession } from '../services/session';
 import { run } from '../composables/useAsyncAction';
 const route = useRoute(),
   router = useRouter(),
   username = ref('');
 onMounted(() =>
   run(async () => {
-    username.value = (await request('/auth/me')).username;
+    username.value = (await getSession()).username;
   }),
 );
 function logout() {

@@ -35,6 +35,10 @@ Linux停止向核对身份的进程发送TERM并等待，超时报告失败，�
 
 发布ZIP不含已有数据库、密钥及历史日志。首次启动会按原初始化规则创建数据；升级时先停止旧实例，备份整个data（数据库和密钥必须成对），只替换lib与bin，按需合并config，不用新包覆盖已有data或logs。不要同时启动两个实例操作同一H2文件。
 
+审计待写文件保存在主密钥所在目录的`audit-outbox`子目录，默认即`data/audit-outbox`，按数据源和摘要/原文分开保存。备份需包含此目录与原主密钥，不得手动删除待写文件；数据库恢复后服务自动补写，仅补写审计，不重放远端操作。每类最多1GiB/10000个待写文件，达到上限会拒绝接收并报告失败。已验证进程退出后恢复；不承诺断电或操作系统崩溃时的持久性。
+
+同步后台默认最多2个独立任务并行，同一任务或共享目标服务器的执行仍串行。可通过`SYNC_PARALLELISM`调整容量，修改后重启生效。管理员登录后可读取`GET /api/v1/system/performance`查看连接池、API耗时、执行/通知积压和审计待写统计；接口不包含凭据或业务正文。
+
 ## 源码构建
 
 在源码根目录执行`mvnw.cmd -Pproduction clean verify`（Linux使用`./mvnw`），依次安装/构建前端、运行前后端验证、生成Spring Boot JAR，并在package阶段生成`target/certificate-manage-0.1.0-dist.zip`及同名展开目录。ZIP内根目录固定为certificateManage。verify成功后再交付ZIP；不要把已生成但verify失败的产物当成验收成功。

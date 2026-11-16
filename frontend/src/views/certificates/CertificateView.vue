@@ -1,30 +1,42 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue';
+import { ref } from 'vue';
 import { request } from '../../api/client';
 import {
   download,
   setCertificateEnabled,
   archiveCertificate,
+  listCertificatePage,
+  type CertificateOwner,
   type CertificateRow,
 } from '../../services/certificates';
 import { run } from '../../composables/useAsyncAction';
+import { invalidateCertificateChains } from '../../services/certificate-chain';
 import { date } from '../../utils/format';
-import { filteredCertificates } from './certificates';
+import { certificateKinds, useCertificatePagination } from './pagination';
 import ImportDialog from './components/ImportDialog.vue';
 import IssueDialog from './components/IssueDialog.vue';
 import DetailDialog from './components/DetailDialog.vue';
 import { ElMessageBox } from 'element-plus';
 const props = defineProps<{ owner: string }>();
-const rows = ref<CertificateRow[]>([]),
-  query = ref(''),
+const query = ref(''),
   purpose = ref(''),
   status = ref(''),
-  loading = ref(false),
   showImport = ref(false),
   showIssue = ref(false),
   issueKind = ref('ROOT'),
   detailId = ref<number>();
 const changingIds = ref(new Set<number>());
+const { tables, load, changePage } = useCertificatePagination(
+  listCertificatePage,
+  () => ({
+    owner: props.owner as CertificateOwner,
+    query: query.value,
+    purpose: purpose.value,
+    status: status.value,
+  }),
+  () => props.owner === 'OWN',
+  run,
+);
 async function changeEnabled(row: { id: number; enabled?: boolean }, enabled: boolean) {
   if (changingIds.value.has(row.id)) return;
   changingIds.value.add(row.id);
@@ -43,13 +55,6 @@ const labels: Record<string, string> = {
   INTERMEDIATE: '中间证书',
   LEAF: '叶子证书',
 };
-const filtered = computed(() =>
-  filteredCertificates(rows.value, query.value, purpose.value).filter(
-    (r) => !status.value || r.status === status.value,
-  ),
-);
-const page = ref(1);
-const visible = computed(() => filtered.value.slice((page.value - 1) * 20, page.value * 20));
 async function archive(row: CertificateRow) {
   if (changingIds.value.has(row.id)) return;
   changingIds.value.add(row.id);
@@ -66,26 +71,11 @@ async function archive(row: CertificateRow) {
     await run(async () => {
       await archiveCertificate(row.id);
       await load();
-      page.value = Math.min(page.value, Math.max(1, Math.ceil(filtered.value.length / 20)));
     });
   } finally {
     changingIds.value.delete(row.id);
   }
 }
-async function load() {
-  loading.value = true;
-  try {
-    rows.value = await request(`/certificates?owner=${props.owner}`);
-  } finally {
-    loading.value = false;
-  }
-}
-watch(
-  () => props.owner,
-  () => run(load),
-  { immediate: true },
-);
-watch([query, purpose, status], () => (page.value = 1));
 function create(kind: string) {
   issueKind.value = kind;
   showIssue.value = true;
@@ -106,6 +96,10 @@ function exported(row: CertificateRow, format: string) {
     await download(row.id, format, pw);
   });
 }
+function refresh() {
+  invalidateCertificateChains();
+  run(load);
+}
 </script>
 <template>
   <div class="page-heading">
@@ -121,7 +115,7 @@ function exported(row: CertificateRow, format: string) {
     <el-button type="primary" @click="showImport = true">导入证书</el-button>
   </div>
   <div class="panel toolbar">
-    <el-input v-model="query" clearable placeholder="搜索CN / 客户" /><el-select
+    <el-input v-model="query" clearable maxlength="200" placeholder="搜索CN / 客户" /><el-select
       v-model="purpose"
       clearable
       placeholder="用途"
@@ -134,18 +128,15 @@ function exported(row: CertificateRow, format: string) {
         :key="s"
         :label="s"
         :value="s" /></el-select
-    ><el-button @click="run(load)">刷新</el-button>
+    ><el-button @click="refresh">刷新</el-button>
   </div>
   <template v-if="owner === 'OWN'"
-    ><section v-for="kind in ['ROOT', 'INTERMEDIATE', 'LEAF']" :key="kind" class="panel">
+    ><section v-for="kind in certificateKinds" :key="kind" class="panel">
       <div class="panel-heading">
         <h2>{{ labels[kind] }}</h2>
         <el-button type="primary" plain @click="create(kind)">创建{{ labels[kind] }}</el-button>
       </div>
-      <el-table
-        :data="filtered.filter((r) => r.kind === kind)"
-        v-loading="loading"
-        empty-text="暂无证书"
+      <el-table :data="tables[kind].items" v-loading="tables[kind].loading" empty-text="暂无证书"
         ><el-table-column prop="name" label="名称" min-width="180" /><el-table-column
           prop="serial"
           label="证书序列号"
@@ -204,14 +195,21 @@ function exported(row: CertificateRow, format: string) {
           ></el-table-column
         ></el-table
       >
-    </section></template
-  >
+      <el-pagination
+        class="pagination"
+        :current-page="tables[kind].page"
+        :page-size="20"
+        :total="tables[kind].total"
+        layout="prev,pager,next,total"
+        @update:current-page="(page: number) => run(() => changePage(kind, page))"
+      /></section
+  ></template>
   <section v-else class="panel">
     <el-table
       ref="clientTable"
-      :data="visible"
+      :data="tables.main.items"
       row-key="id"
-      v-loading="loading"
+      v-loading="tables.main.loading"
       @expand-change="
         (row: CertificateRow, expanded: CertificateRow[]) => run(() => expand(row, expanded))
       "
@@ -287,10 +285,11 @@ function exported(row: CertificateRow, format: string) {
       ></el-table
     ><el-pagination
       class="pagination"
-      v-model:current-page="page"
+      :current-page="tables.main.page"
       :page-size="20"
-      :total="filtered.length"
+      :total="tables.main.total"
       layout="prev,pager,next,total"
+      @update:current-page="(page: number) => run(() => changePage('main', page))"
     />
   </section>
   <ImportDialog v-model="showImport" :owner="owner" @saved="run(load)" /><IssueDialog

@@ -38,7 +38,7 @@ class WorkflowQueriesTest {
     db.execute(
         "create table sync_tasks(id bigint primary key,name varchar,description varchar,config_revision bigint,state varchar,schedule_enabled boolean,cron varchar,timezone varchar,next_fire_at timestamp with time zone,deleted_at timestamp with time zone,schedule_json clob)");
     db.execute(
-        "create table sync_runs(id bigint primary key,task_id bigint,status varchar,created_at timestamp with time zone)");
+        "create table sync_runs(id bigint primary key,task_id bigint,status varchar,created_at timestamp with time zone,trigger_type varchar,task_revision bigint,error_summary varchar,started_at timestamp with time zone,finished_at timestamp with time zone)");
     db.execute(
         "create table sync_task_steps(task_id bigint,position int,step_key varchar,name varchar,component_type varchar,config_json varchar,secret_bundle_id bigint)");
     workflows = new WorkflowService(db, null, new ObjectMapper(), null, null, null, null, null);
@@ -56,7 +56,7 @@ class WorkflowQueriesTest {
     }
     db.update("update sync_tasks set deleted_at=current_timestamp where id=4");
     db.update(
-        "insert into sync_runs values(10,1,'FAILED',current_timestamp),(11,1,'SUCCESS',timestamp with time zone '2000-01-01 00:00:00+00'),(12,2,'RUNNING',current_timestamp)");
+        "insert into sync_runs(id,task_id,status,created_at) values(10,1,'FAILED',current_timestamp),(11,1,'SUCCESS',timestamp with time zone '2000-01-01 00:00:00+00'),(12,2,'RUNNING',current_timestamp)");
     var tasks = workflows.list();
     assertThat(tasks).extracting(t -> t.get("id")).containsExactly(3L, 2L, 1L);
     assertThat(tasks.get(0)).containsEntry("lastStatus", null);

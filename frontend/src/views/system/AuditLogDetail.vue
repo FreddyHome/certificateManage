@@ -17,7 +17,9 @@ const failures = ref<Record<string, string>>({});
 const views = ref<Record<string, 'text' | 'base64'>>({});
 const bodyCache = ref<Record<string, string>>({});
 
-onMounted(async () => {
+async function loadDetail() {
+  loading.value = true;
+  error.value = '';
   try {
     detail.value = await request<AuditDetail>(`/execution-logs/${props.id}`);
   } catch (failure) {
@@ -25,7 +27,8 @@ onMounted(async () => {
   } finally {
     loading.value = false;
   }
-});
+}
+onMounted(loadDetail);
 
 async function loadOriginal(id: string) {
   if (originals.value[id] || busy.value[id]) return;
@@ -70,6 +73,7 @@ async function copy(text: string) {
     @close="emit('close')"
   >
     <div v-loading="loading" class="audit-detail">
+      <el-button :loading="loading" @click="loadDetail">刷新详情</el-button>
       <el-alert v-if="error" :title="error" type="error" :closable="false" />
       <template v-if="detail">
         <h3>{{ detail.entry.message }}</h3>
@@ -78,8 +82,18 @@ async function copy(text: string) {
           <template v-if="detail.entry.runId"> · 执行 #{{ detail.entry.runId }}</template
           ><template v-if="detail.entry.stepKey"> · 步骤 {{ detail.entry.stepKey }}</template>
         </p>
+        <p v-if="detail.entry.details?.requestUrl">
+          后端请求 URL：{{ detail.entry.details.requestMethod }}
+          {{ detail.entry.details.requestUrl }}
+        </p>
         <el-alert
-          v-if="!detail.hasOriginals"
+          v-if="detail.pendingOriginals"
+          title="后台尚有待写审计，当前原始详情可能未完整，请稍后刷新。"
+          type="info"
+          :closable="false"
+        />
+        <el-alert
+          v-if="!detail.hasOriginals && !detail.pendingOriginals"
           title="此条记录尚无原始详情。历史未采集的报文和堆栈无法补回。"
           type="info"
           :closable="false"

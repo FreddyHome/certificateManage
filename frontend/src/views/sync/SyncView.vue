@@ -7,6 +7,7 @@ import SyncRunDetail from './SyncRunDetail.vue';
 import { syncStatus as status } from './sync-editor';
 import { formatScheduleTime } from './schedule-editor';
 import { useSyncTasks } from './useSyncTasks';
+import { invalidateCertificateChains } from '../../services/certificate-chain';
 
 const router = useRouter();
 const {
@@ -83,7 +84,10 @@ function viewAudit(id: number) {
     :customers="customers"
     :maps="maps"
     :validation="validation"
-    @close="form = null"
+    @close="
+      form = null;
+      invalidateCertificateChains();
+    "
     @save="run(save)"
     @validate="validate"
     @add="add"

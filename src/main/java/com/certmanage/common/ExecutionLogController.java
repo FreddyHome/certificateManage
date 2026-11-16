@@ -19,7 +19,14 @@ public class ExecutionLogController {
       @RequestParam(required = false) String from,
       @RequestParam(required = false) String to,
       @RequestParam(defaultValue = "1") int page,
-      @RequestParam(defaultValue = "50") int size) {
+      @RequestParam(defaultValue = "50") int size,
+      @RequestParam(defaultValue = "offset") String paging,
+      @RequestParam(required = false) String cursor,
+      @RequestParam(defaultValue = "true") boolean includeTotal) {
+    com.certmanage.common.Errors.require(
+        java.util.Set.of("offset", "cursor").contains(paging), "分页方式不合法");
+    if (paging.equals("cursor"))
+      return log.cursor(source, runId, outcome, from, to, size, cursor, includeTotal);
     return log.list(source, runId, outcome, from, to, page, size);
   }
 

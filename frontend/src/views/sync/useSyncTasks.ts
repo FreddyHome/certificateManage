@@ -1,5 +1,6 @@
 import { onMounted, ref } from 'vue';
 import { createBusinessStep } from './business-editor';
+import { invalidateCertificateChains } from '../../services/certificate-chain';
 import type { BusinessComponent } from '../../services/sync-types';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { run } from '../../composables/useAsyncAction';
@@ -53,17 +54,17 @@ export function useSyncTasks() {
     rows.value = await listSyncTasks();
   }
 
-  onMounted(() =>
-    run(async () => {
-      await load();
-      const options = await loadSyncOptions();
-      customers.value = options.customers;
-      servers.value = options.servers;
-      certs.value = options.certificates;
-    }),
-  );
+  async function loadOptions() {
+    const options = await loadSyncOptions();
+    customers.value = options.customers;
+    servers.value = options.servers;
+    certs.value = options.certificates;
+  }
+
+  onMounted(() => Promise.all([run(load), run(loadOptions)]));
 
   function edit(row?: SyncTaskSummary) {
+    invalidateCertificateChains();
     return run(async () => {
       form.value = row ? await getSyncTask(row.id) : createTask();
       maps.value = parameterMaps(form.value.steps);
@@ -97,8 +98,7 @@ export function useSyncTasks() {
 
   async function save() {
     if (!form.value) return;
-    const result = await saveSyncTask(taskPayload(form.value, maps.value));
-    form.value = await getSyncTask(result.id || form.value.id!);
+    form.value = await saveSyncTask(taskPayload(form.value, maps.value));
     await load();
     ElMessage.success('已保存');
   }

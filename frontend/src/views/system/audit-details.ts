@@ -34,8 +34,16 @@ export interface OriginalEvent {
 }
 
 export interface AuditDetail {
-  entry: { id: number; message: string; runId?: number; stepKey?: string; source: string };
+  entry: {
+    id: number;
+    message: string;
+    runId?: number;
+    stepKey?: string;
+    source: string;
+    details?: { requestUrl?: string; requestMethod?: string };
+  };
   hasOriginals: boolean;
+  pendingOriginals?: number;
   rawEvents: OriginalEvent[];
   events: { id: number; message: string; occurredAt: string; eventCode: string; outcome: string }[];
 }

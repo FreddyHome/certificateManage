@@ -1,3 +1,4 @@
+import { invalidateSession } from '../services/session-state';
 export interface RequestOptions {
   /** 由业务服务显式开启，基础传输层不识别业务路径。 */
   idempotent?: boolean;
@@ -25,6 +26,7 @@ async function assertSuccess(response: Response, path: string, fallback: string)
   }
   if (response.status === 401) {
     token = '';
+    invalidateSession();
     if (path !== '/auth/login' && typeof location !== 'undefined') location.hash = '/login';
   }
   throw new Error(message);
@@ -62,7 +64,10 @@ async function send(
     body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body),
   });
   await assertSuccess(response, path, fallback);
-  if (path === '/auth/logout') token = '';
+  if (['/auth/login', '/auth/logout', '/auth/password'].includes(path)) {
+    invalidateSession();
+    token = '';
+  }
   return response;
 }
 

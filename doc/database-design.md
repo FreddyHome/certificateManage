@@ -1,6 +1,6 @@
 # 数据库表设计
 
-> 当前口径（2026-11-16）：实际迁移为 V1–V12，共36张业务/辅助表，不含Flyway自身表。V10为SSH类型约束的Java迁移；V11新增计划JSON字段，V12扩展调度表达式长度，均不新增表。下文V1/V4/V5表数量及基础字典保留对应阶段背景；`app_sessions`、`scheduler_state`目前预留。其他差异见[历史核对基线](requirements-design-review-2026-11-14.md)。
+> 当前口径（2026-11-16）：实际迁移为 V1–V13，共36张业务/辅助表，不含Flyway自身表。V10为SSH类型约束的Java迁移；V11新增计划JSON字段，V12扩展调度表达式长度，V13增加审计幂等字段及检索索引，均不新增表。下文V1/V4/V5表数量及基础字典保留对应阶段背景；`app_sessions`、`scheduler_state`目前预留。其他差异见[历史核对基线](requirements-design-review-2026-11-14.md)。
 
 ## 当前迁移索引
 
@@ -18,8 +18,13 @@
 | V10 | Java 迁移，扩展服务器协议及步骤类型白名单以接受 SSH | 0 |
 | V11 | `sync_tasks.schedule_json CLOB`，保存结构化执行计划，旧记录允许为空 | 0 |
 | V12 | `sync_tasks.cron`由`VARCHAR(100)`扩为`VARCHAR(500)`，容纳五列多选 | 0 |
+| V13 | `execution_logs.delivery_key VARCHAR(36)`可空唯一；增加审计检索、任务最新执行及到期扫描索引 | 0 |
 
-当前以 `src/main/resources/db/migration` 的V1–V9、V11/V12 SQL及 `src/main/java/db/migration` 的V10 Java迁移为执行来源。`doc/sql`保留历史SQL文档副本，不作为运行迁移来源；不要补建重复版本。以下保留历史基础字段字典。
+当前以 `src/main/resources/db/migration` 的V1–V9、V11–V13 SQL及 `src/main/java/db/migration` 的V10 Java迁移为执行来源。`doc/sql`保留历史SQL文档副本，不作为运行迁移来源；不要补建重复版本。以下保留历史基础字段字典。
+
+### P2检索与审计幂等（V13）
+
+`delivery_key`允许旧记录为空，新摘要生成稳定UUID，`uq_execution_delivery`唯一索引用于补写去重。索引`ix_exec_run_time(run_id,occurred_at,id)`、`ix_exec_source_result_time(source,outcome,occurred_at,id)`、`ix_exec_result_time(outcome,occurred_at,id)`支持筛选与时间/ID游标；`ix_sync_task_latest(task_id,id)`位于sync_runs，`ix_sync_due_time(schedule_enabled,deleted_at,next_fire_at,id)`位于sync_tasks。数据库外的加密待写文件不是新表，不能仅备份数据库而漏掉待写目录和原主密钥。
 
 ### 执行计划字段（V11/V12）
 

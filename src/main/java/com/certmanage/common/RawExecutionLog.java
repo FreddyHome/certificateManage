@@ -5,7 +5,6 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.time.OffsetDateTime;
 import java.util.*;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DuplicateKeyException;
@@ -19,7 +18,7 @@ import org.springframework.stereotype.Service;
  * @date 2026-11-13
  */
 @Service
-public class RawExecutionLog {
+public class RawExecutionLog implements PerformanceSource {
   private static final ThreadLocal<State> CURRENT = new ThreadLocal<>();
   private static final ThreadLocal<Boolean> WRITING = ThreadLocal.withInitial(() -> false);
   private final JdbcTemplate db;
@@ -27,7 +26,8 @@ public class RawExecutionLog {
   private final ObjectMapper rawJson;
   private final org.springframework.transaction.support.TransactionTemplate writeTransaction;
   private final SecretStore secrets;
-  private final Queue<Pending> pending = new ConcurrentLinkedQueue<>();
+  private final DurableAuditOutbox<Pending> pending;
+  private static final long MAX_PENDING_BYTES = 1024L * 1024 * 1024;
   private final java.util.concurrent.ExecutorService writer =
       java.util.concurrent.Executors.newSingleThreadExecutor(
           r -> {
@@ -54,6 +54,7 @@ public class RawExecutionLog {
     final String trace = UUID.randomUUID().toString();
     final AtomicLong sequence = new AtomicLong();
     String step;
+    volatile DurableAuditOutbox<Pending>.Reservation reservation;
 
     State(RawExecutionLog owner, String step) {
       this.owner = owner;
@@ -78,6 +79,13 @@ public class RawExecutionLog {
     this.db = db;
     this.json = json;
     this.secrets = secrets;
+    this.pending =
+        new DurableAuditOutbox<>(
+            DurableAuditOutbox.directory(db, secrets, "raw"),
+            json,
+            secrets,
+            Pending.class,
+            MAX_PENDING_BYTES);
     this.rawJson = json.copy();
     this.rawJson
         .getFactory()
@@ -193,7 +201,14 @@ public class RawExecutionLog {
     public void record(String kind, String title, Map<String, ?> payload) {
       if (state != null)
         state.owner.store(
-            state.trace, step, state.sequence.incrementAndGet(), kind, title, payload, true);
+            state.trace,
+            step,
+            state.sequence.incrementAndGet(),
+            kind,
+            title,
+            payload,
+            true,
+            state.reservation);
     }
 
     /**
@@ -272,7 +287,8 @@ public class RawExecutionLog {
         "APPLICATION",
         "应用执行事件",
         payload,
-        false);
+        false,
+        state == null ? null : state.reservation);
     return trace;
   }
 
@@ -287,6 +303,7 @@ public class RawExecutionLog {
    * @param title 标题
    * @param payload 原始数据
    * @param asynchronous 是否禁止在调用线程等待数据库连接
+   * @param reservation 当前远端操作预留的磁盘预算，可为空
    */
   private void store(
       String trace,
@@ -295,11 +312,13 @@ public class RawExecutionLog {
       String kind,
       String title,
       Map<String, ?> payload,
-      boolean asynchronous) {
+      boolean asynchronous,
+      DurableAuditOutbox<Pending>.Reservation reservation) {
     if (WRITING.get()) return;
     WRITING.set(true);
     try {
-      byte[] bytes = json.writeValueAsBytes(payload);
+      var encoded = AuditPayloadCodec.encode(json, payload);
+      byte[] bytes = encoded.bytes();
       var event =
           new Pending(
               UUID.randomUUID().toString(),
@@ -309,22 +328,15 @@ public class RawExecutionLog {
               OffsetDateTime.now(),
               kind,
               title,
-              bytes.length,
+              encoded.size(),
               secrets.seal(bytes));
       Arrays.fill(bytes, (byte) 0);
+      pending.enqueue(event.id(), event, reservation);
       if (asynchronous
           || org.springframework.transaction.support.TransactionSynchronizationManager
-              .isActualTransactionActive()) {
-        pending.add(event);
-        scheduleFlush();
-      } else
-        try {
-          insert(event);
-        } catch (DataAccessException
-            | org.springframework.transaction.TransactionException unavailable) {
-          pending.add(event);
-        }
-    } catch (com.fasterxml.jackson.core.JsonProcessingException failure) {
+              .isActualTransactionActive()) scheduleFlush();
+      else flushPending();
+    } catch (java.io.IOException failure) {
       throw new IllegalStateException("原始日志编码失败", failure);
     } finally {
       WRITING.remove();
@@ -339,20 +351,18 @@ public class RawExecutionLog {
    */
   private void insert(Pending event) {
     try {
-      writeTransaction.executeWithoutResult(
-          status ->
-              db.update(
-                  "insert into execution_log_raw(id,trace_id,step_key,event_order,occurred_at,kind,title,payload_bytes,payload_ciphertext,payload_nonce) values(?,?,?,?,?,?,?,?,?,?)",
-                  event.id,
-                  event.trace,
-                  event.step,
-                  event.order,
-                  event.time,
-                  event.kind,
-                  event.title,
-                  event.size,
-                  event.sealed.ciphertext(),
-                  event.sealed.nonce()));
+      db.update(
+          "insert into execution_log_raw(id,trace_id,step_key,event_order,occurred_at,kind,title,payload_bytes,payload_ciphertext,payload_nonce) values(?,?,?,?,?,?,?,?,?,?)",
+          event.id,
+          event.trace,
+          event.step,
+          event.order,
+          event.time,
+          event.kind,
+          event.title,
+          event.size,
+          event.sealed.ciphertext(),
+          event.sealed.nonce());
     } catch (DuplicateKeyException alreadyStored) {
     }
   }
@@ -364,16 +374,18 @@ public class RawExecutionLog {
    */
   @Scheduled(fixedDelay = 10000, initialDelay = 10000)
   public synchronized void flushPending() {
-    for (int i = 0; i < 200; i++) {
-      var event = pending.peek();
-      if (event == null) return;
-      try {
-        insert(event);
-        pending.remove();
-      } catch (DataAccessException
-          | org.springframework.transaction.TransactionException unavailable) {
-        return;
-      }
+    try {
+      pending.drain(
+          200,
+          32L * 1024 * 1024 + 28,
+          events ->
+              writeTransaction.executeWithoutResult(
+                  status -> {
+                    for (var event : events) insert(event);
+                  }));
+    } catch (DataAccessException
+        | org.springframework.transaction.TransactionException unavailable) {
+      // 已强制落盘的密文留待下次刷新，不重放远端请求。
     }
   }
 
@@ -399,17 +411,7 @@ public class RawExecutionLog {
   }
 
   /**
-   * @description 查看详情时刷新已排队事件，业务事务内部不抢占第二个连接
-   * @author Freddy
-   * @date 2026-11-13
-   */
-  private void flushWhenSafe() {
-    if (!org.springframework.transaction.support.TransactionSynchronizationManager
-        .isActualTransactionActive()) flushPending();
-  }
-
-  /**
-   * @description 关闭前等待日志线程并尽量保存剩余密文，不重放业务操作
+   * @description 关闭前有界等待日志线程，所有未确认事件已可靠落盘留待重启恢复
    * @author Freddy
    * @date 2026-11-13
    */
@@ -420,11 +422,6 @@ public class RawExecutionLog {
       writer.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
-    }
-    while (!pending.isEmpty()) {
-      int before = pending.size();
-      flushPending();
-      if (pending.size() >= before) break;
     }
   }
 
@@ -437,7 +434,7 @@ public class RawExecutionLog {
    * @return 原始事件元数据
    */
   public List<Map<String, Object>> metadata(String trace, String step) {
-    flushWhenSafe();
+
     if (trace == null) return List.of();
     String where = " where trace_id=?" + (step == null ? "" : " and step_key=?");
     Object[] args = step == null ? new Object[] {trace} : new Object[] {trace, step};
@@ -470,7 +467,7 @@ public class RawExecutionLog {
    * @return 原始载荷
    */
   public Map<String, Object> payload(String trace, String step, String id) {
-    flushWhenSafe();
+
     if (trace == null)
       throw new org.springframework.web.server.ResponseStatusException(
           org.springframework.http.HttpStatus.NOT_FOUND, "没有原始详情");
@@ -495,11 +492,79 @@ public class RawExecutionLog {
           id,
           "payload",
           rawJson.readValue(
-              bytes, new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}));
+              AuditPayloadCodec.input(bytes),
+              new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}));
     } catch (Exception failure) {
       throw new IllegalStateException("原始日志读取失败", failure);
     } finally {
       Arrays.fill(bytes, (byte) 0);
     }
+  }
+
+  /**
+   * @description 在远端副作用之前原子预留96MiB及128个事件槽位，并发操作不能重复使用预算
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 无上下文时返回空租约，执行上下文内返回空间预留租约
+   */
+  public static RemoteCapacity reserveRemoteCapacity() {
+    var state = CURRENT.get();
+    if (state == null) return () -> {};
+    if (state.reservation != null) return () -> {};
+    var reservation = state.owner.pending.reserve(96L * 1024 * 1024);
+    state.reservation = reservation;
+    return () -> {
+      state.reservation = null;
+      reservation.close();
+    };
+  }
+
+  /**
+   * @description 远端审计预算租约，关闭时不抛出异常避免覆盖业务结果
+   * @author Freddy
+   * @date 2026-11-16
+   */
+  public interface RemoteCapacity extends AutoCloseable {
+    /**
+     * @description 释放远端操作未使用的审计预算
+     * @author Freddy
+     * @date 2026-11-16
+     */
+    @Override
+    void close();
+  }
+
+  /**
+   * @description 返回原始审计指标分组名称
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 固定分组名称
+   */
+  public String performanceName() {
+    return "rawAudit";
+  }
+
+  /**
+   * @description 返回无内容的审计积压指标
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 磁盘条数和字节限额
+   */
+  public Map<String, Object> performanceSnapshot() {
+    return Map.of(
+        "pendingCount",
+        pending.pendingCount(),
+        "pendingBytes",
+        pending.pendingBytes(),
+        "maxPendingBytes",
+        MAX_PENDING_BYTES,
+        "reservedBytes",
+        pending.reservedBytes(),
+        "missingFiles",
+        pending.missingFiles(),
+        "maxPendingCount",
+        10000,
+        "batchBytes",
+        32L * 1024 * 1024 + 28);
   }
 }

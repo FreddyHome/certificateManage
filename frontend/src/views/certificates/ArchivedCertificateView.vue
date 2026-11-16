@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { ref } from 'vue';
 import { ElMessageBox } from 'element-plus';
 import {
-  listArchivedCertificates,
+  listArchivedCertificatePage,
   restoreCertificate,
   deleteArchivedCertificate,
   download,
@@ -10,38 +10,20 @@ import {
   type CertificateRow,
 } from '../../services/certificates';
 import { run } from '../../composables/useAsyncAction';
+import { invalidateCertificateChains } from '../../services/certificate-chain';
 import { date } from '../../utils/format';
-import { filteredCertificates } from './certificates';
+import { useCertificatePagination } from './pagination';
 import DetailDialog from './components/DetailDialog.vue';
-const rows = ref<CertificateRow[]>([]);
 const owner = ref<CertificateOwner | ''>('');
 const query = ref('');
-const loading = ref(false);
 const busy = ref(new Set<number>());
-const page = ref(1);
 const detailId = ref<number>();
-const filtered = computed(() => filteredCertificates(rows.value, query.value, ''));
-const visible = computed(() => filtered.value.slice((page.value - 1) * 20, page.value * 20));
-let loadVersion = 0;
-async function load() {
-  const version = ++loadVersion;
-  loading.value = true;
-  try {
-    const result = await listArchivedCertificates(owner.value || undefined);
-    if (version === loadVersion) rows.value = result;
-  } finally {
-    if (version === loadVersion) loading.value = false;
-  }
-}
-watch(
-  owner,
-  () => {
-    page.value = 1;
-    run(load);
-  },
-  { immediate: true },
+const { tables, load, changePage } = useCertificatePagination(
+  listArchivedCertificatePage,
+  () => ({ owner: owner.value, query: query.value }),
+  () => false,
+  run,
 );
-watch(query, () => (page.value = 1));
 async function act(row: CertificateRow, action: 'restore' | 'delete') {
   if (busy.value.has(row.id)) return;
   busy.value.add(row.id);
@@ -65,7 +47,6 @@ async function act(row: CertificateRow, action: 'restore' | 'delete') {
       if (action === 'restore') await restoreCertificate(row.id);
       else await deleteArchivedCertificate(row.id);
       await load();
-      page.value = Math.min(page.value, Math.max(1, Math.ceil(filtered.value.length / 20)));
     });
   } finally {
     busy.value.delete(row.id);
@@ -92,6 +73,10 @@ async function exported(row: CertificateRow, format: string) {
     busy.value.delete(row.id);
   }
 }
+function refresh() {
+  invalidateCertificateChains();
+  run(load);
+}
 </script>
 <template>
   <div class="page-heading">
@@ -101,14 +86,14 @@ async function exported(row: CertificateRow, format: string) {
     </div>
   </div>
   <div class="panel toolbar">
-    <el-input v-model="query" clearable placeholder="搜索CN / 客户" />
+    <el-input v-model="query" clearable maxlength="200" placeholder="搜索CN / 客户" />
     <el-select v-model="owner" clearable placeholder="证书归属"
       ><el-option label="自有证书" value="OWN" /><el-option label="客户证书" value="CUSTOMER"
     /></el-select>
-    <el-button :loading="loading" @click="run(load)">刷新</el-button>
+    <el-button :loading="tables.main.loading" @click="refresh">刷新</el-button>
   </div>
   <section class="panel">
-    <el-table :data="visible" v-loading="loading" empty-text="暂无归档证书">
+    <el-table :data="tables.main.items" v-loading="tables.main.loading" empty-text="暂无归档证书">
       <el-table-column prop="name" label="名称" min-width="180" />
       <el-table-column label="归属" width="110"
         ><template #default="{ row }">{{
@@ -155,10 +140,11 @@ async function exported(row: CertificateRow, format: string) {
     </el-table>
     <el-pagination
       class="pagination"
-      v-model:current-page="page"
+      :current-page="tables.main.page"
       :page-size="20"
-      :total="filtered.length"
+      :total="tables.main.total"
       layout="prev,pager,next,total"
+      @update:current-page="(page: number) => run(() => changePage('main', page))"
     />
   </section>
   <DetailDialog :id="detailId" @closed="detailId = undefined" />

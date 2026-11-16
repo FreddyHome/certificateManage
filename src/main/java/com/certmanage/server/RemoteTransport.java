@@ -19,7 +19,7 @@ import org.springframework.stereotype.Service;
  * @author Freddy
  * @date 2026-11-12
  */
-public class RemoteTransport {
+public class RemoteTransport implements com.certmanage.common.PerformanceSource {
   final ServerService servers;
   final ObjectMapper json;
   private static final java.util.concurrent.ScheduledExecutorService DEADLINES =
@@ -105,17 +105,19 @@ public class RemoteTransport {
    */
   public Map<String, Object> execute(
       long serverId, long configId, Map<String, Object> step, byte[] data, String filename) {
-    Errors.require(!"READ".equals(step.get("operation")), "读取操作必须使用文件输出入口");
-    Errors.require(servers.enabled(serverId), "服务器已停用");
-    var c = servers.connection(configId);
-    try {
-      if ("SSH".equals(c.get("type"))) return SshCommandTransport.call(c, step, false);
-      return "SFTP".equals(c.get("type"))
-          ? sftp(c, step, data, filename, false, 0).metadata()
-          : http(c, step, data, filename, false);
-    } catch (Exception e) {
-      RawExecutionLog.exception(e);
-      throw RemoteFailure.of(str(c, "type", "REMOTE"), "REMOTE_CALL", c, e);
+    try (var budget = RawExecutionLog.reserveRemoteCapacity()) {
+      Errors.require(!"READ".equals(step.get("operation")), "读取操作必须使用文件输出入口");
+      Errors.require(servers.enabled(serverId), "服务器已停用");
+      var c = versionedConnection(configId);
+      try {
+        if ("SSH".equals(c.get("type"))) return SshCommandTransport.call(c, step, false);
+        return "SFTP".equals(c.get("type"))
+            ? sftp(c, step, data, filename, false, 0).metadata()
+            : http(c, step, data, filename, false);
+      } catch (Exception e) {
+        RawExecutionLog.exception(e);
+        throw RemoteFailure.of(str(c, "type", "REMOTE"), "REMOTE_CALL", c, e);
+      }
     }
   }
 
@@ -130,16 +132,18 @@ public class RemoteTransport {
    * @return 文件内容、原文件名及源路径；原文另存加密审计详情
    */
   public RemoteFile readFile(long serverId, long configId, Map<String, Object> step, int maxBytes) {
-    Errors.require(servers.enabled(serverId), "服务器已停用");
-    Errors.require("READ".equals(step.get("operation")), "读取操作类型错误");
-    Errors.require(maxBytes >= 0 && maxBytes <= 10 * 1024 * 1024, "文件读取限制不合法");
-    var connection = servers.connection(configId);
-    Errors.require("SFTP".equals(connection.get("type")), "读取文件必须选择 SFTP 服务器");
-    try {
-      return sftp(connection, step, null, null, false, maxBytes).file();
-    } catch (Exception failure) {
-      RawExecutionLog.exception(failure);
-      throw RemoteFailure.of("SFTP", "READ", connection, failure);
+    try (var budget = RawExecutionLog.reserveRemoteCapacity()) {
+      Errors.require(servers.enabled(serverId), "服务器已停用");
+      Errors.require("READ".equals(step.get("operation")), "读取操作类型错误");
+      Errors.require(maxBytes >= 0 && maxBytes <= 10 * 1024 * 1024, "文件读取限制不合法");
+      var connection = versionedConnection(configId);
+      Errors.require("SFTP".equals(connection.get("type")), "读取文件必须选择 SFTP 服务器");
+      try {
+        return sftp(connection, step, null, null, false, maxBytes).file();
+      } catch (Exception failure) {
+        RawExecutionLog.exception(failure);
+        throw RemoteFailure.of("SFTP", "READ", connection, failure);
+      }
     }
   }
 
@@ -165,40 +169,42 @@ public class RemoteTransport {
    * @return 无效配置时抛出异常，否则返回处理结果
    */
   public Map<String, Object> test(long id) {
-    var snap = servers.snapshot(id);
-    var c = servers.connection(((Number) snap.get("configId")).longValue());
-    long begin = System.nanoTime();
-    try {
-      if ("SSH".equals(c.get("type"))) {
-        var connected = SshCommandTransport.call(c, Map.of(), true);
+    try (var budget = RawExecutionLog.reserveRemoteCapacity()) {
+      var snap = servers.snapshot(id);
+      var c = versionedConnection(((Number) snap.get("configId")).longValue());
+      long begin = System.nanoTime();
+      try {
+        if ("SSH".equals(c.get("type"))) {
+          var connected = SshCommandTransport.call(c, Map.of(), true);
+          return Map.of(
+              "success",
+              true,
+              "elapsedMs",
+              (System.nanoTime() - begin) / 1000000,
+              "result",
+              connected);
+        }
+        var result =
+            "SFTP".equals(c.get("type"))
+                ? sftp(c, Map.of(), null, null, true, 0).metadata()
+                : http(c, Map.of(), null, null, true);
+        return Map.of(
+            "success", true, "elapsedMs", (System.nanoTime() - begin) / 1000000, "result", result);
+      } catch (Exception e) {
+        RawExecutionLog.exception(e);
+        var failure = RemoteFailure.of(str(c, "type", "REMOTE"), "REMOTE_CALL", c, e);
         return Map.of(
             "success",
-            true,
+            false,
             "elapsedMs",
             (System.nanoTime() - begin) / 1000000,
-            "result",
-            connected);
+            "message",
+            failure.getMessage(),
+            "errorCode",
+            failure.code(),
+            "stage",
+            failure.stage());
       }
-      var result =
-          "SFTP".equals(c.get("type"))
-              ? sftp(c, Map.of(), null, null, true, 0).metadata()
-              : http(c, Map.of(), null, null, true);
-      return Map.of(
-          "success", true, "elapsedMs", (System.nanoTime() - begin) / 1000000, "result", result);
-    } catch (Exception e) {
-      RawExecutionLog.exception(e);
-      var failure = RemoteFailure.of(str(c, "type", "REMOTE"), "REMOTE_CALL", c, e);
-      return Map.of(
-          "success",
-          false,
-          "elapsedMs",
-          (System.nanoTime() - begin) / 1000000,
-          "message",
-          failure.getMessage(),
-          "errorCode",
-          failure.code(),
-          "stage",
-          failure.stage());
     }
   }
 
@@ -345,7 +351,7 @@ public class RemoteTransport {
                   "filename",
                   Objects.toString(filename, ""),
                   "bodyBase64",
-                  data == null ? "" : Base64.getEncoder().encodeToString(data),
+                  data == null ? new byte[0] : data,
                   "bytes",
                   data == null ? 0 : data.length));
           Errors.require(Set.of("UPLOAD", "MOVE", "READ").contains(operation), "SFTP操作类型不合法");
@@ -392,7 +398,7 @@ public class RemoteTransport {
                                   "path",
                                   path,
                                   "bodyBase64",
-                                  Base64.getEncoder().encodeToString(captured),
+                                  captured,
                                   "bytes",
                                   captured.length,
                                   "complete",
@@ -566,12 +572,14 @@ public class RemoteTransport {
    */
   public RemoteFile readHttpFile(
       long serverId, long configId, Map<String, Object> step, int maxBytes) throws Exception {
-    Errors.require(servers.enabled(serverId), "来源服务器已停用");
-    var result = http(servers.connection(configId), step, null, "", false, true);
-    byte[] bytes = (byte[]) result.get("fileContent");
-    Errors.require(bytes.length <= maxBytes, "文件超过流程大小限制");
-    String path = result.get("path").toString();
-    return new RemoteFile(bytes, path.substring(path.lastIndexOf('/') + 1), path);
+    try (var budget = RawExecutionLog.reserveRemoteCapacity()) {
+      Errors.require(servers.enabled(serverId), "来源服务器已停用");
+      var result = http(versionedConnection(configId), step, null, "", false, true);
+      byte[] bytes = (byte[]) result.get("fileContent");
+      Errors.require(bytes.length <= maxBytes, "文件超过流程大小限制");
+      String path = result.get("path").toString();
+      return new RemoteFile(bytes, path.substring(path.lastIndexOf('/') + 1), path);
+    }
   }
 
   /**
@@ -740,12 +748,8 @@ public class RemoteTransport {
     }
     Errors.require(body.length <= 16777216, "请求过大");
     builder.method(method, HttpRequest.BodyPublishers.ofByteArray(body));
-    try (var client =
-        HttpClient.newBuilder()
-            .sslContext(tls(c))
-            .connectTimeout(Duration.ofSeconds(((Number) c.get("connectTimeout")).longValue()))
-            .followRedirects(HttpClient.Redirect.NEVER)
-            .build()) {
+    try (var lease = acquireClient(c)) {
+      var client = lease.entry.client;
       var request = builder.build();
       var raw = RawExecutionLog.sink();
       raw.record(
@@ -759,10 +763,13 @@ public class RemoteTransport {
               "headers",
               request.headers().map(),
               "bodyBase64",
-              Base64.getEncoder().encodeToString(body),
+              body,
               "bytes",
               body.length));
+      long sendStarted = System.nanoTime();
       var response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
+      sendNanos.add(System.nanoTime() - sendStarted);
+      long bodyStarted = System.nanoTime();
       byte[] bytes;
       try (var in = response.body();
           var deadline =
@@ -794,7 +801,7 @@ public class RemoteTransport {
                               "headers",
                               response.headers().map(),
                               "bodyBase64",
-                              Base64.getEncoder().encodeToString(captured),
+                              captured,
                               "bytes",
                               captured.length,
                               "complete",
@@ -806,6 +813,7 @@ public class RemoteTransport {
           throw failure;
         }
       }
+      responseNanos.add(System.nanoTime() - bodyStarted);
       Errors.require(bytes.length <= (readFile ? 14 * 1024 * 1024 : 1048576), "响应过大");
       Object codes = (test ? c : step).get(test ? "testCodes" : "successCodes");
       boolean success =
@@ -996,17 +1004,12 @@ public class RemoteTransport {
     var store = java.security.KeyStore.getInstance("JKS");
     store.load(null, null);
     int index = 0;
-    for (Object material : (Collection<?>) c.getOrDefault("_trustMaterialIds", List.of())) {
-      for (var row :
-          servers.db.queryForList(
-              "select certificate_der from certificate_materials where id=?", material)) {
-        var cert =
-            (java.security.cert.X509Certificate)
-                java.security.cert.CertificateFactory.getInstance("X.509")
-                    .generateCertificate(
-                        new ByteArrayInputStream((byte[]) row.get("CERTIFICATE_DER")));
-        if (cert.getBasicConstraints() >= 0) store.setCertificateEntry("ca" + (index++), cert);
-      }
+    for (byte[] der : trustDer(c)) {
+      var cert =
+          (java.security.cert.X509Certificate)
+              java.security.cert.CertificateFactory.getInstance("X.509")
+                  .generateCertificate(new ByteArrayInputStream(der));
+      if (cert.getBasicConstraints() >= 0) store.setCertificateEntry("ca" + (index++), cert);
     }
     var extra =
         javax.net.ssl.TrustManagerFactory.getInstance(
@@ -1086,5 +1089,210 @@ public class RemoteTransport {
       decoded = next;
     }
     Errors.require(!decoded.contains("%"), "路径编码不合法");
+  }
+
+  private final LinkedHashMap<String, ClientEntry> clients = new LinkedHashMap<>(16, 0.75f, true);
+  private final java.util.concurrent.atomic.LongAdder
+      created = new java.util.concurrent.atomic.LongAdder(),
+      reused = new java.util.concurrent.atomic.LongAdder(),
+      sendNanos = new java.util.concurrent.atomic.LongAdder(),
+      responseNanos = new java.util.concurrent.atomic.LongAdder();
+  private boolean stopping;
+  private static final int MAX_CLIENTS = 64;
+
+  /**
+   * @description 保存共享客户端及在途引用，退休后等待最后租约关闭
+   * @author Freddy
+   * @date 2026-11-16
+   */
+  private static final class ClientEntry {
+    final HttpClient client;
+    int users;
+    boolean retired;
+
+    /**
+     * @description 保存客户端所有权供租约共享
+     * @author Freddy
+     * @date 2026-11-16
+     * @param client 新建客户端
+     */
+    ClientEntry(HttpClient client) {
+      this.client = client;
+    }
+  }
+
+  /**
+   * @description 在响应体关闭前持有客户端引用，防止LRU提前关闭在途连接
+   * @author Freddy
+   * @date 2026-11-16
+   */
+  private final class ClientLease implements AutoCloseable {
+    final ClientEntry entry;
+
+    /**
+     * @description 持有已在缓存锁内增加的引用
+     * @author Freddy
+     * @date 2026-11-16
+     * @param entry 缓存条目
+     */
+    ClientLease(ClientEntry entry) {
+      this.entry = entry;
+    }
+
+    /**
+     * @description 归还引用，服务关闭时仅由最后使用者关闭客户端
+     * @author Freddy
+     * @date 2026-11-16
+     */
+    public void close() {
+      synchronized (clients) {
+        entry.users--;
+        if (entry.retired && entry.users == 0) entry.client.close();
+      }
+    }
+  }
+
+  /**
+   * @description 每次读取当前可用配置，再附加不可变版本键，避免复用掩盖停用检查
+   * @author Freddy
+   * @date 2026-11-16
+   * @param id 配置版本
+   * @return 独立连接快照
+   */
+  private Map<String, Object> versionedConnection(long id) {
+    var copy = new HashMap<>(servers.connection(id));
+    copy.put("_clientConfigId", id);
+    return copy;
+  }
+
+  /**
+   * @description 读取本次信任证书字节，缓存键包含材料版本且TLS解析只发生在新建客户端时
+   * @author Freddy
+   * @date 2026-11-16
+   * @param config 连接快照
+   * @return 本次材料快照
+   */
+  @SuppressWarnings("unchecked")
+  private List<byte[]> trustDer(Map<String, Object> config) {
+    if (config.containsKey("_clientTrustDer")) return (List<byte[]>) config.get("_clientTrustDer");
+    var result = new ArrayList<byte[]>();
+    for (Object id : (Collection<?>) config.getOrDefault("_trustMaterialIds", List.of()))
+      for (var row :
+          servers.db.queryForList(
+              "select certificate_der from certificate_materials where id=?", id))
+        result.add((byte[]) row.get("CERTIFICATE_DER"));
+    return result;
+  }
+
+  /**
+   * @description 有界借用HTTP客户端；仅淘汰空闲条目，全部使用中时显式背压
+   * @author Freddy
+   * @date 2026-11-16
+   * @param config 当前已校验连接快照
+   * @return 引用计数租约
+   * @throws Exception TLS配置失败或缓存已关闭
+   */
+  private ClientLease acquireClient(Map<String, Object> config) throws Exception {
+    var digest = java.security.MessageDigest.getInstance("SHA-256");
+    var materials = trustDer(config);
+    for (byte[] der : materials) digest.update(der);
+    String key =
+        Objects.toString(config.get("_clientConfigId"), "")
+            + "/"
+            + config.get("baseUrl")
+            + "/"
+            + config.get("connectTimeout")
+            + "/"
+            + HexFormat.of().formatHex(digest.digest());
+    synchronized (clients) {
+      if (stopping) throw new IllegalStateException("远程HTTP客户端已关闭");
+      var entry = clients.get(key);
+      if (entry != null) {
+        reused.increment();
+        entry.users++;
+        return new ClientLease(entry);
+      }
+      if (clients.size() >= MAX_CLIENTS) {
+        var iterator = clients.entrySet().iterator();
+        boolean removed = false;
+        while (iterator.hasNext()) {
+          var candidate = iterator.next().getValue();
+          if (candidate.users == 0) {
+            iterator.remove();
+            candidate.client.close();
+            removed = true;
+            break;
+          }
+        }
+        if (!removed) throw new IllegalStateException("远程HTTP客户端并发达到上限");
+      }
+      var snapshot = new HashMap<>(config);
+      snapshot.put("_clientTrustDer", materials);
+      entry =
+          new ClientEntry(
+              HttpClient.newBuilder()
+                  .sslContext(tls(snapshot))
+                  .connectTimeout(
+                      Duration.ofSeconds(((Number) config.get("connectTimeout")).longValue()))
+                  .followRedirects(HttpClient.Redirect.NEVER)
+                  .build());
+      entry.users = 1;
+      clients.put(key, entry);
+      created.increment();
+      return new ClientLease(entry);
+    }
+  }
+
+  /**
+   * @description 关闭空闲客户端，在途请求归还租约后关闭，避免中断其他请求
+   * @author Freddy
+   * @date 2026-11-16
+   */
+  @jakarta.annotation.PreDestroy
+  public void stop() {
+    synchronized (clients) {
+      stopping = true;
+      for (var entry : clients.values()) {
+        entry.retired = true;
+        if (entry.users == 0) entry.client.close();
+      }
+      clients.clear();
+    }
+  }
+
+  /**
+   * @description 返回远端性能分组名称
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 固定分组
+   */
+  public String performanceName() {
+    return "remoteTransport";
+  }
+
+  /**
+   * @description 返回不包含目标或正文的客户端复用和HTTP阶段累计耗时
+   * @author Freddy
+   * @date 2026-11-16
+   * @return 聚合指标
+   */
+  public Map<String, Object> performanceSnapshot() {
+    synchronized (clients) {
+      return Map.of(
+          "cachedClients",
+          clients.size(),
+          "activeLeases",
+          clients.values().stream().mapToInt(e -> e.users).sum(),
+          "maxClients",
+          MAX_CLIENTS,
+          "clientsCreated",
+          created.sum(),
+          "clientsReused",
+          reused.sum(),
+          "httpSendNanos",
+          sendNanos.sum(),
+          "httpResponseNanos",
+          responseNanos.sum());
+    }
   }
 }

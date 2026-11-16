@@ -34,8 +34,8 @@ export function saveSyncTask(task: SyncTask) {
 }
 
 export async function loadSyncOptions() {
-  const servers = await request<SyncServer[]>('/servers');
-  const [own, customer, customers] = await Promise.all([
+  const [servers, own, customer, customers] = await Promise.all([
+    request<SyncServer[]>('/servers'),
     request<SyncCertificate[]>('/certificates?owner=OWN'),
     request<SyncCertificate[]>('/certificates?owner=CUSTOMER'),
     listCustomers(),

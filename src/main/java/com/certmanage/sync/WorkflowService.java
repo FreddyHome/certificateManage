@@ -389,16 +389,14 @@ public class WorkflowService {
             var c = map(step.get("config"));
             if (c.get("serverId") != null) {
               long server = id(c, "serverId");
-              var snapshot = servers.snapshot(server);
-              serverSnapshots.put(server, snapshot);
+              var snapshot = serverSnapshots.computeIfAbsent(server, servers::snapshot);
               step.put("serverSnapshot", snapshot);
             }
             if (BusinessComponents.matches(c)
                 && c.get("sourceServerId") != null
                 && !"TN_CERTIFICATE".equals(c.get("businessComponent"))) {
               long source = id(c, "sourceServerId");
-              var snapshot = servers.snapshot(source);
-              serverSnapshots.put(source, snapshot);
+              var snapshot = serverSnapshots.computeIfAbsent(source, servers::snapshot);
               step.put("sourceServerSnapshot", snapshot);
             }
           }
@@ -413,47 +411,63 @@ public class WorkflowService {
               task.get("revision"),
               encode(task));
           long run = db.queryForObject("select max(id) from sync_runs", Long.class);
+          var secretRefs = new LinkedHashSet<Long>();
+          var certificateRefs = new LinkedHashSet<List<Long>>();
           for (var step : steps) {
             if (step.get("secretId") != null)
-              db.update(
-                  "merge into sync_run_secret_bundles key(run_id,secret_bundle_id) values(?,?)",
-                  run,
-                  step.get("secretId"));
+              secretRefs.add(((Number) step.get("secretId")).longValue());
             for (var ref : maps(map(step.get("config")).get("references")))
-              recordCert(run, id(ref, "assetId"), id(ref, "materialId"));
+              certificateRefs.add(List.of(id(ref, "assetId"), id(ref, "materialId")));
           }
+          var serverRows = new ArrayList<Object[]>();
+          var configIds = new LinkedHashSet<Long>();
           for (var snapshot : serverSnapshots.values()) {
             long config = id(snapshot, "configId");
-            db.update(
-                "insert into sync_run_servers values(?,?,?)", run, id(snapshot, "id"), config);
-            var secretIds =
+            configIds.add(config);
+            serverRows.add(new Object[] {run, id(snapshot, "id"), config});
+          }
+          if (!configIds.isEmpty()) {
+            String placeholders = String.join(",", Collections.nCopies(configIds.size(), "?"));
+            secretRefs.addAll(
                 db.queryForList(
-                    "select secret_bundle_id from managed_server_configs where id=? and secret_bundle_id is not null",
+                    "select secret_bundle_id from managed_server_configs where id in ("
+                        + placeholders
+                        + ") and secret_bundle_id is not null",
                     Long.class,
-                    config);
-            for (long secret : secretIds)
-              db.update(
-                  "merge into sync_run_secret_bundles key(run_id,secret_bundle_id) values(?,?)",
-                  run,
-                  secret);
+                    configIds.toArray()));
             for (var ref :
                 db.queryForList(
-                    "select source_asset_id,material_id from managed_server_trust_certificates where server_config_id=?",
-                    config))
-              recordCert(
-                  run,
-                  ((Number) ref.get("SOURCE_ASSET_ID")).longValue(),
-                  ((Number) ref.get("MATERIAL_ID")).longValue());
+                    "select source_asset_id,material_id from managed_server_trust_certificates where server_config_id in ("
+                        + placeholders
+                        + ")",
+                    configIds.toArray())) {
+              certificateRefs.add(
+                  List.of(
+                      ((Number) ref.get("SOURCE_ASSET_ID")).longValue(),
+                      ((Number) ref.get("MATERIAL_ID")).longValue()));
+            }
           }
+          if (!serverRows.isEmpty())
+            db.batchUpdate("insert into sync_run_servers values(?,?,?)", serverRows);
+          if (!secretRefs.isEmpty())
+            db.batchUpdate(
+                "insert into sync_run_secret_bundles values(?,?)",
+                secretRefs.stream().map(secret -> new Object[] {run, secret}).toList());
+          if (!certificateRefs.isEmpty())
+            db.batchUpdate(
+                "insert into sync_run_certificates(run_id,source_asset_id,material_id,fingerprint) select ?,?,?,fingerprint_sha256 from certificate_materials where id=?",
+                certificateRefs.stream()
+                    .map(ref -> new Object[] {run, ref.get(0), ref.get(1), ref.get(1)})
+                    .toList());
+          var stepRows = new ArrayList<Object[]>();
           int p = 0;
           for (var step : steps)
-            db.update(
+            stepRows.add(
+                new Object[] {run, step.get("key"), ++p, step.get("type"), step.get("name")});
+          if (!stepRows.isEmpty())
+            db.batchUpdate(
                 "insert into sync_run_steps(run_id,step_key,position,component_type,name) values(?,?,?,?,?)",
-                run,
-                step.get("key"),
-                ++p,
-                step.get("type"),
-                step.get("name"));
+                stepRows);
           if (user != null) audit.record(user, "SYNC_EXECUTE", "SYNC_RUN", run);
           logs.append(
               "SYNC",
@@ -472,26 +486,6 @@ public class WorkflowService {
                   task.get("revision")));
           return run;
         });
-  }
-
-  /**
-   * @description 将证书材料和指纹记录到执行引用中，保留相同材料引用的幂等写入。
-   * @author Freddy
-   * @date 2026-11-12
-   * @param run 执行记录主键
-   * @param asset 证书资产主键
-   * @param material 证书材料主键
-   */
-  private void recordCert(long run, long asset, long material) {
-    db.update(
-        "merge into sync_run_certificates key(run_id,source_asset_id,material_id) values(?,?,?,?)",
-        run,
-        asset,
-        material,
-        db.queryForObject(
-            "select fingerprint_sha256 from certificate_materials where id=?",
-            String.class,
-            material));
   }
 
   /**

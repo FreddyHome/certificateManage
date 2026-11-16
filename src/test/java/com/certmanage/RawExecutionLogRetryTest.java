@@ -122,4 +122,63 @@ class RawExecutionLogRetryTest {
     log.flushPending();
     assertEquals(1, persisted.size());
   }
+
+  @Test
+  void largeBytesSurviveRestartWithoutPlaintextSpool() throws Exception {
+    var unavailable = new AtomicBoolean(true);
+    var rows = new ArrayList<Object[]>();
+    var db =
+        new JdbcTemplate() {
+          @Override
+          public int update(String sql, Object... args) {
+            if (unavailable.get()) throw new DataAccessResourceFailureException("down");
+            rows.add(args.clone());
+            return 1;
+          }
+        };
+    var manager =
+        new PlatformTransactionManager() {
+          public TransactionStatus getTransaction(TransactionDefinition definition) {
+            return new SimpleTransactionStatus();
+          }
+
+          public void commit(TransactionStatus status) {}
+
+          public void rollback(TransactionStatus status) {}
+        };
+    var key = new SecretStore(folder.resolve("large-master.key").toString());
+    var mapper = new ObjectMapper();
+    mapper
+        .getFactory()
+        .setStreamReadConstraints(
+            com.fasterxml.jackson.core.StreamReadConstraints.builder()
+                .maxStringLength(32 * 1024 * 1024)
+                .build());
+    byte[] body = new byte[16 * 1024 * 1024];
+    new Random(42).nextBytes(body);
+    var first = new RawExecutionLog(db, mapper, key, manager);
+    String trace = first.application("LARGE", "secret-marker", Map.of("bodyBase64", body), null);
+    first.stop();
+    assertTrue(rows.isEmpty());
+    try (var paths = java.nio.file.Files.walk(folder)) {
+      for (var path : paths.filter(p -> p.toString().endsWith(".audit")).toList())
+        assertFalse(
+            new String(java.nio.file.Files.readAllBytes(path), StandardCharsets.ISO_8859_1)
+                .contains("secret-marker"));
+    }
+    var restored = new RawExecutionLog(db, mapper, key, manager);
+    unavailable.set(false);
+    restored.flushPending();
+    restored.flushPending();
+    assertEquals(1, rows.size());
+    assertEquals(trace, rows.getFirst()[1]);
+    var row = rows.getFirst();
+    byte[] compressed = key.open((byte[]) row[8], (byte[]) row[9]);
+    assertEquals(31, compressed[0] & 255);
+    var tree =
+        mapper.readTree(
+            new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(compressed)));
+    assertArrayEquals(body, tree.path("details").path("bodyBase64").binaryValue());
+    restored.stop();
+  }
 }

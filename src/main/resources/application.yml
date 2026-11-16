@@ -12,6 +12,10 @@ spring:
 server:
   address: ${SERVER_ADDRESS:127.0.0.1}
   port: ${PORT:8080}
+  compression:
+    enabled: true
+    min-response-size: 1024
+    mime-types: text/html,text/xml,text/plain,text/css,text/javascript,application/javascript,application/json,application/xml,image/svg+xml
   servlet:
     session:
       timeout: 30m
@@ -20,6 +24,9 @@ server:
         same-site: strict
 app:
   encryption-key-file: ${ENCRYPTION_KEY_FILE:./data/master.key}
+  sync:
+    parallelism: ${SYNC_PARALLELISM:2}
+    shutdown-wait-seconds: 5
 
 spring.task.scheduling.pool.size: 4
 

@@ -50,6 +50,13 @@ class RawAuditPoolTest {
                 long start = System.nanoTime();
                 RawExecutionLog.event("POOL_TEST", "原始连接池事件", Map.of("message", "before rollback"));
                 assertTrue(java.time.Duration.ofNanos(System.nanoTime() - start).toMillis() < 500);
+                long awaitingDeadline =
+                    System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+                while (pool.getHikariPoolMXBean().getThreadsAwaitingConnection() == 0
+                    && System.nanoTime() < awaitingDeadline) Thread.yield();
+                assertTrue(
+                    pool.getHikariPoolMXBean().getThreadsAwaitingConnection() > 0,
+                    "writer must be waiting for the held connection");
                 var sink = RawExecutionLog.sink();
                 var callback =
                     java.util.concurrent.CompletableFuture.runAsync(

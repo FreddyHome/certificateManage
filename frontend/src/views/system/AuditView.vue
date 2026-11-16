@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onScopeDispose } from 'vue';
 import { useRoute } from 'vue-router';
 import { request } from '../../api/client';
 import { run } from '../../composables/useAsyncAction';
@@ -15,6 +15,10 @@ const route = useRoute(),
   total = ref(0),
   rows = ref<any[]>([]),
   loading = ref(false);
+const cursors = ref<string[]>(['']);
+const hasMore = ref(false);
+const nextCursor = ref<string | null>(null);
+let generation = 0;
 const sources: Record<string, string> = {
   SYNC: '证书同步',
   SERVER: '服务器测试',
@@ -47,9 +51,15 @@ const fields: Record<string, string> = {
   errorType: '异常类型',
 };
 async function load() {
+  const version = ++generation;
   loading.value = true;
   try {
-    const q = new URLSearchParams({ page: String(page.value), size: '50' });
+    const q = new URLSearchParams({
+      paging: 'cursor',
+      cursor: cursors.value[page.value - 1] || '',
+      includeTotal: String(page.value === 1),
+      size: '50',
+    });
     if (source.value) q.set('source', source.value);
     if (outcome.value) q.set('outcome', outcome.value);
     if (runId.value) q.set('runId', String(runId.value));
@@ -58,17 +68,36 @@ async function load() {
       q.set('to', new Date(times.value[1]!).toISOString());
     }
     const data = await request('/execution-logs?' + q);
+    if (version !== generation) return;
     rows.value = data.items;
-    total.value = data.total;
+    if (data.total !== undefined) total.value = data.total;
+    hasMore.value = data.hasMore;
+    nextCursor.value = data.nextCursor;
+  } catch (error) {
+    if (version === generation) throw error;
   } finally {
-    loading.value = false;
+    if (version === generation) loading.value = false;
   }
 }
 function search() {
+  ++generation;
   page.value = 1;
+  cursors.value = [''];
+  run(load);
+}
+function previous() {
+  if (page.value <= 1 || loading.value) return;
+  page.value--;
+  run(load);
+}
+function next() {
+  if (!hasMore.value || !nextCursor.value || loading.value) return;
+  cursors.value = [...cursors.value.slice(0, page.value), nextCursor.value];
+  page.value++;
   run(load);
 }
 onMounted(() => run(load));
+onScopeDispose(() => ++generation);
 </script>
 <template>
   <div class="page-heading">
@@ -105,7 +134,7 @@ onMounted(() => run(load));
       end-placeholder="结束时间"
       style="width: 360px"
     /><el-button type="primary" @click="search">查询</el-button
-    ><el-button @click="run(load)">刷新</el-button>
+    ><el-button @click="search">刷新</el-button>
   </div>
   <div class="panel">
     <el-table :data="rows" v-loading="loading" empty-text="暂无审计日志"
@@ -139,19 +168,21 @@ onMounted(() => run(load));
         label="操作 / 执行内容"
         min-width="300"
         show-overflow-tooltip
-      /><el-table-column label="操作" width="110" fixed="right"
+      /><el-table-column label="后端请求 URL" min-width="280" show-overflow-tooltip>
+        <template #default="{ row }">{{
+          row.details?.requestUrl ? `${row.details.requestMethod} ${row.details.requestUrl}` : '—'
+        }}</template> </el-table-column
+      ><el-table-column label="操作" width="110" fixed="right"
         ><template #default="{ row }"
           ><el-button link type="primary" @click="detailId = row.id">查看详情</el-button></template
         ></el-table-column
       ></el-table
-    ><el-pagination
-      class="pagination"
-      v-model:current-page="page"
-      :total="total"
-      :page-size="50"
-      layout="prev,pager,next,total"
-      @current-change="run(load)"
-    />
+    >
+    <div class="pagination">
+      <el-button :disabled="page <= 1 || loading" @click="previous">上一页</el-button>
+      <span>第 {{ page }} 页 · 共 {{ total }} 条</span>
+      <el-button :disabled="!hasMore || loading" @click="next">下一页</el-button>
+    </div>
   </div>
   <AuditLogDetail v-if="detailId" :key="detailId" :id="detailId" @close="detailId = null" />
 </template>

@@ -1,5 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router';
-import { request } from '../api/client';
+import { getSession } from '../services/session';
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
@@ -40,7 +40,7 @@ const router = createRouter({
 router.beforeEach(async (to) => {
   if (to.path === '/login') return;
   try {
-    await request('/auth/me');
+    await getSession();
   } catch {
     return '/login';
   }

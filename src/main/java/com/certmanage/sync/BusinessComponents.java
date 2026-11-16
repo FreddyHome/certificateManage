@@ -31,6 +31,8 @@ public class BusinessComponents {
   private final RemoteTransport transport;
   private final ObjectMapper json;
   private static final int FILE_LIMIT = 10 * 1024 * 1024;
+  private static final String CURRENT_CHAIN_SQL =
+      " and m.not_before<=current_timestamp and m.not_after>=current_timestamp and exists(select 1 from asset_chain_nodes valid_node where valid_node.asset_id=a.id) and not exists(select 1 from asset_chain_nodes invalid_node join certificate_materials invalid_material on invalid_material.id=invalid_node.material_id where invalid_node.asset_id=a.id and (invalid_material.not_before>current_timestamp or invalid_material.not_after<current_timestamp))";
 
   /**
    * @description 注入业务组件使用的证书、连接、秘密及报文服务
@@ -78,218 +80,225 @@ public class BusinessComponents {
    * @throws Exception 证书编码或配置不合法
    */
   public void prepare(Map<String, Object> step, boolean strict) throws Exception {
-    var c = map(step.get("config"));
-    String kind = str(c, "businessComponent", "");
-    require(Set.of("IS_TRUSTSTORE", "IS_KEYSTORE", "TN_CERTIFICATE").contains(kind), "业务组件类型错误");
-    require("HTTP".equals(step.get("type")), "业务组件必须使用HTTP步骤载体");
-    c.remove("resolvedBody");
-    c.remove("resolvedEntries");
-    c.remove("resolvedAssetId");
-    var refs = new ArrayList<Map<String, Object>>();
-    c.put("references", refs);
-    c.put(
-        "path",
-        endpoint(
-            c,
-            "path",
-            "serverId",
-            kind.equals("TN_CERTIFICATE")
-                ? "/restv2/wm.certificate:cert/tn/update"
-                : "/restv2/wm.certificate:cert/keystore/update",
-            "HTTP",
-            strict));
-    if (kind.equals("IS_TRUSTSTORE")) {
-      String sourceType = str(c, "sourceType", "SFTP");
-      require(Set.of("HTTP", "SFTP").contains(sourceType), "请选择SFTP或HTTP来源");
-      c.put("sourceType", sourceType);
-      String sourcePath = str(c, "sourcePath", "");
-      if (strict || !sourcePath.isBlank()) validFilePath(sourcePath);
+    try (var scope = certs.materialScope()) {
+      var c = map(step.get("config"));
+      String kind = str(c, "businessComponent", "");
+      require(Set.of("IS_TRUSTSTORE", "IS_KEYSTORE", "TN_CERTIFICATE").contains(kind), "业务组件类型错误");
+      require("HTTP".equals(step.get("type")), "业务组件必须使用HTTP步骤载体");
+      c.remove("resolvedBody");
+      c.remove("resolvedEntries");
+      c.remove("resolvedAssetId");
+      var refs = new ArrayList<Map<String, Object>>();
+      c.put("references", refs);
       c.put(
-          "sourceUrl",
+          "path",
           endpoint(
               c,
-              "sourceUrl",
-              "sourceServerId",
-              "/restv2/wm.certificate:cert/keystore/get",
-              sourceType,
+              "path",
+              "serverId",
+              kind.equals("TN_CERTIFICATE")
+                  ? "/restv2/wm.certificate:cert/tn/update"
+                  : "/restv2/wm.certificate:cert/keystore/update",
+              "HTTP",
               strict));
-      String method = str(c, "sourceMethod", "GET");
-      require(Set.of("GET", "POST").contains(method), "读取方法只支持GET或POST");
-      c.put("sourceMethod", method);
-      c.put(
-          "sourceHeaders",
-          map(c.getOrDefault("sourceHeaders", Map.of("Content-Type", "application/json"))));
-      c.put("sourceQuery", map(c.get("sourceQuery")));
-    } else {
-      for (String field :
-          List.of(
-              "sourceServerId",
-              "sourceType",
-              "sourceUrl",
-              "sourceMethod",
-              "sourceHeaders",
-              "sourceQuery",
-              "sourcePath")) c.remove(field);
-    }
-    if (kind.equals("IS_KEYSTORE")) {
-      String format = str(c, "format", "PKCS12");
-      require(Set.of("JKS", "PKCS12").contains(format), "请选择JKS或PKCS12格式");
-      c.put("format", format);
-      String path = str(c, "storePath", "");
-      if (strict || !path.isBlank()) validFilePath(path);
-    }
-    if (!kind.equals("TN_CERTIFICATE")) {
-      var secret = secrets.read(step.get("secretId") instanceof Number n ? n.longValue() : null);
-      if (strict) {
-        require(!str(secret, "password", "").isEmpty(), "请填写与原配置一致的证书库密码");
-        if (kind.equals("IS_KEYSTORE"))
-          require(!str(secret, "keyPassword", "").isEmpty(), "请填写私钥密码");
-        require(!str(c, "keyStoreName", "").isBlank(), "请填写keyStoreName");
-      }
-      String name = str(c, "keyStoreName", "");
-      require(
-          name.length() <= 200 && name.codePoints().noneMatch(Character::isISOControl),
-          "keyStoreName不合法");
-    }
-    String mode = str(c, "selectionMode", "AUTO");
-    require(Set.of("AUTO", "MANUAL").contains(mode), "证书选择模式错误");
-    c.put("selectionMode", mode);
-    Long selected = null;
-    if (kind.equals("IS_KEYSTORE")) {
-      if (c.get("certificateId") != null) {
-        selected = id(c, "certificateId");
-        if (mode.equals("AUTO")) {
-          // 基准只用于匹配CN，软删除后仍保留材料；候选必须满足正常可用条件。
-          var names =
-              db.queryForList(
-                  "select m.common_name from certificate_assets a join certificate_materials m on m.id=a.material_id where a.id=? and a.owner_type='OWN' and a.certificate_kind='LEAF' and exists(select 1 from private_keys p where p.own_asset_id=a.id)",
-                  String.class,
-                  selected);
-          require(names.size() == 1, "请选择含私钥的自有终端证书作为CN基准");
-          String cn = Objects.toString(names.getFirst(), "");
-          require(!cn.isBlank(), "自动选证要求基准叶子证书CN非空");
-          c.put("certificateCn", cn);
-          selected = null;
-          var candidates =
-              db.queryForList(
-                  "select a.id from certificate_assets a join certificate_materials m on m.id=a.material_id where a.owner_type='OWN' and a.certificate_kind='LEAF' and m.common_name=? and a.deleted_at is null and a.archived_at is null and a.enabled=true and exists(select 1 from private_keys p where p.own_asset_id=a.id) order by m.not_after desc,a.id desc",
-                  Long.class,
-                  cn);
-          for (long asset : candidates) {
-            if (available(asset)) {
-              selected = asset;
-              break;
-            }
-          }
-          if (strict) require(selected != null, "同CN的自有证书中没有含私钥且整链有效的可用证书");
-        } else {
-          var d = certs.detail(selected);
-          require(
-              "OWN".equals(d.get("owner"))
-                  && "LEAF".equals(d.get("kind"))
-                  && Boolean.TRUE.equals(d.get("hasKey")),
-              "请选择含私钥的自有终端证书");
-          c.remove("certificateCn");
-        }
-      } else if (strict) throw new IllegalArgumentException("请选择自有终端证书");
-    } else {
-      String purpose = str(c, "purpose", "GENERAL");
-      require(Set.of("AS2", "HTTPS", "GENERAL").contains(purpose), "证书用途错误");
-      c.put("purpose", purpose);
-      if (c.get("customerId") != null) {
-        long customer = id(c, "customerId");
-        var rows =
-            db.queryForList("select external_id,id_type from customers where id=?", customer);
-        require(rows.size() == 1, "客户不存在");
-        var candidates =
-            db.queryForList(
-                "select a.id from certificate_assets a join certificate_materials m on m.id=a.material_id where a.owner_type='CUSTOMER' and a.customer_id=? and a.purpose=? and a.deleted_at is null and a.archived_at is null and a.enabled=true order by m.not_after desc,a.id desc",
-                Long.class,
-                customer,
-                purpose);
-        if (mode.equals("MANUAL")) {
-          if (c.get("certificateId") != null) {
-            selected = id(c, "certificateId");
-            require(candidates.contains(selected), "所选证书不属于当前客户用途或已停用归档");
-          } else if (strict) throw new IllegalArgumentException("请选择证书链");
-        } else
-          for (long asset : candidates) {
-            if (available(asset)) {
-              selected = asset;
-              break;
-            }
-          }
-        if (strict) require(selected != null, "该客户用途下没有可用证书链");
-        if (selected != null && kind.equals("TN_CERTIFICATE")) {
-          String external = Objects.toString(rows.getFirst().get("EXTERNAL_ID"), ""),
-              idType = Objects.toString(rows.getFirst().get("ID_TYPE"), "");
-          if (strict) require(!external.isBlank() && !idType.isBlank(), "请补齐客户对外标识及标识类型");
-          var chain = new ArrayList<Map<String, Object>>();
-          int index = 1;
-          for (var certificate : certs.chainCertificates(selected))
-            chain.add(
-                Map.of(
-                    "index",
-                    index++,
-                    "certificateBase64",
-                    Base64.getEncoder().encodeToString(certificate.getEncoded())));
-          c.put(
-              "resolvedBody",
-              json.writeValueAsString(
-                  Map.of("id", external, "idType", idType, "certChain", chain)));
-        }
-      } else if (strict) throw new IllegalArgumentException("请选择客户");
-    }
-    if (selected != null) {
-      if (strict) {
-        certs.requireEnabled(selected);
-        require(available(selected), "所选证书链尚未生效或已过期");
-      }
-      c.put("resolvedAssetId", selected);
-      var nodes =
-          db.queryForList(
-              "select material_id from asset_chain_nodes where asset_id=? order by node_position",
-              Long.class,
-              selected);
-      Set<Long> requested = new HashSet<>();
-      if (kind.equals("IS_TRUSTSTORE") && mode.equals("MANUAL") && c.containsKey("materialIds")) {
-        require(c.get("materialIds") instanceof List<?>, "节点选择格式错误");
-        for (Object value : (List<?>) c.get("materialIds")) {
-          require(value instanceof Number, "节点标识错误");
-          requested.add(((Number) value).longValue());
-        }
-        require(!requested.isEmpty() && nodes.containsAll(requested), "至少选择一个属于当前链的节点");
-      }
-      var entries = new ArrayList<Map<String, Object>>();
-      for (long material : nodes) {
-        if (kind.equals("IS_TRUSTSTORE") && !requested.isEmpty() && !requested.contains(material))
-          continue;
-        var ref =
-            Map.<String, Object>of(
-                "assetId",
-                selected,
-                "materialId",
-                material,
-                "alias",
-                alias(material),
-                "role",
-                kind.equals("IS_KEYSTORE") ? "CHAIN" : "TRUST");
-        refs.add(ref);
-        entries.add(ref);
+      if (kind.equals("IS_TRUSTSTORE")) {
+        String sourceType = str(c, "sourceType", "SFTP");
+        require(Set.of("HTTP", "SFTP").contains(sourceType), "请选择SFTP或HTTP来源");
+        c.put("sourceType", sourceType);
+        String sourcePath = str(c, "sourcePath", "");
+        if (strict || !sourcePath.isBlank()) validFilePath(sourcePath);
+        c.put(
+            "sourceUrl",
+            endpoint(
+                c,
+                "sourceUrl",
+                "sourceServerId",
+                "/restv2/wm.certificate:cert/keystore/get",
+                sourceType,
+                strict));
+        String method = str(c, "sourceMethod", "GET");
+        require(Set.of("GET", "POST").contains(method), "读取方法只支持GET或POST");
+        c.put("sourceMethod", method);
+        c.put(
+            "sourceHeaders",
+            map(c.getOrDefault("sourceHeaders", Map.of("Content-Type", "application/json"))));
+        c.put("sourceQuery", map(c.get("sourceQuery")));
+      } else {
+        for (String field :
+            List.of(
+                "sourceServerId",
+                "sourceType",
+                "sourceUrl",
+                "sourceMethod",
+                "sourceHeaders",
+                "sourceQuery",
+                "sourcePath")) c.remove(field);
       }
       if (kind.equals("IS_KEYSTORE")) {
-        String keyAlias = str(c, "alias", "");
-        if (keyAlias.isBlank()) keyAlias = Objects.toString(certs.detail(selected).get("name"), "");
-        require(!keyAlias.isBlank(), "证书CN为空，请填写keystore别名");
-        var privateEntry = new LinkedHashMap<>(entries.getLast());
-        privateEntry.put("alias", keyAlias);
-        privateEntry.put("role", "PRIVATE");
-        entries.clear();
-        entries.add(privateEntry);
+        String format = str(c, "format", "PKCS12");
+        require(Set.of("JKS", "PKCS12").contains(format), "请选择JKS或PKCS12格式");
+        c.put("format", format);
+        String path = str(c, "storePath", "");
+        if (strict || !path.isBlank()) validFilePath(path);
       }
-      c.put("resolvedEntries", entries);
+      if (!kind.equals("TN_CERTIFICATE")) {
+        var secret = secrets.read(step.get("secretId") instanceof Number n ? n.longValue() : null);
+        if (strict) {
+          require(!str(secret, "password", "").isEmpty(), "请填写与原配置一致的证书库密码");
+          if (kind.equals("IS_KEYSTORE"))
+            require(!str(secret, "keyPassword", "").isEmpty(), "请填写私钥密码");
+          require(!str(c, "keyStoreName", "").isBlank(), "请填写keyStoreName");
+        }
+        String name = str(c, "keyStoreName", "");
+        require(
+            name.length() <= 200 && name.codePoints().noneMatch(Character::isISOControl),
+            "keyStoreName不合法");
+      }
+      String mode = str(c, "selectionMode", "AUTO");
+      require(Set.of("AUTO", "MANUAL").contains(mode), "证书选择模式错误");
+      c.put("selectionMode", mode);
+      Long selected = null;
+      if (kind.equals("IS_KEYSTORE")) {
+        if (c.get("certificateId") != null) {
+          selected = id(c, "certificateId");
+          if (mode.equals("AUTO")) {
+            // 基准只用于匹配CN，软删除后仍保留材料；候选必须满足正常可用条件。
+            var names =
+                db.queryForList(
+                    "select m.common_name from certificate_assets a join certificate_materials m on m.id=a.material_id where a.id=? and a.owner_type='OWN' and a.certificate_kind='LEAF' and exists(select 1 from private_keys p where p.own_asset_id=a.id)",
+                    String.class,
+                    selected);
+            require(names.size() == 1, "请选择含私钥的自有终端证书作为CN基准");
+            String cn = Objects.toString(names.getFirst(), "");
+            require(!cn.isBlank(), "自动选证要求基准叶子证书CN非空");
+            c.put("certificateCn", cn);
+            selected = null;
+            var candidates =
+                db.queryForList(
+                    "select a.id from certificate_assets a join certificate_materials m on m.id=a.material_id where a.owner_type='OWN' and a.certificate_kind='LEAF' and m.common_name=? and a.deleted_at is null and a.archived_at is null and a.enabled=true and exists(select 1 from private_keys p where p.own_asset_id=a.id)"
+                        + CURRENT_CHAIN_SQL
+                        + " order by m.not_after desc,a.id desc",
+                    Long.class,
+                    cn);
+            for (long asset : candidates) {
+              if (available(asset)) {
+                selected = asset;
+                break;
+              }
+            }
+            if (strict) require(selected != null, "同CN的自有证书中没有含私钥且整链有效的可用证书");
+          } else {
+            var d = certs.detail(selected);
+            require(
+                "OWN".equals(d.get("owner"))
+                    && "LEAF".equals(d.get("kind"))
+                    && Boolean.TRUE.equals(d.get("hasKey")),
+                "请选择含私钥的自有终端证书");
+            c.remove("certificateCn");
+          }
+        } else if (strict) throw new IllegalArgumentException("请选择自有终端证书");
+      } else {
+        String purpose = str(c, "purpose", "GENERAL");
+        require(Set.of("AS2", "HTTPS", "GENERAL").contains(purpose), "证书用途错误");
+        c.put("purpose", purpose);
+        if (c.get("customerId") != null) {
+          long customer = id(c, "customerId");
+          var rows =
+              db.queryForList("select external_id,id_type from customers where id=?", customer);
+          require(rows.size() == 1, "客户不存在");
+          var candidates =
+              db.queryForList(
+                  "select a.id from certificate_assets a join certificate_materials m on m.id=a.material_id where a.owner_type='CUSTOMER' and a.customer_id=? and a.purpose=? and a.deleted_at is null and a.archived_at is null and a.enabled=true"
+                      + (mode.equals("AUTO") ? CURRENT_CHAIN_SQL : "")
+                      + " order by m.not_after desc,a.id desc",
+                  Long.class,
+                  customer,
+                  purpose);
+          if (mode.equals("MANUAL")) {
+            if (c.get("certificateId") != null) {
+              selected = id(c, "certificateId");
+              require(candidates.contains(selected), "所选证书不属于当前客户用途或已停用归档");
+            } else if (strict) throw new IllegalArgumentException("请选择证书链");
+          } else
+            for (long asset : candidates) {
+              if (available(asset)) {
+                selected = asset;
+                break;
+              }
+            }
+          if (strict) require(selected != null, "该客户用途下没有可用证书链");
+          if (selected != null && kind.equals("TN_CERTIFICATE")) {
+            String external = Objects.toString(rows.getFirst().get("EXTERNAL_ID"), ""),
+                idType = Objects.toString(rows.getFirst().get("ID_TYPE"), "");
+            if (strict) require(!external.isBlank() && !idType.isBlank(), "请补齐客户对外标识及标识类型");
+            var chain = new ArrayList<Map<String, Object>>();
+            int index = 1;
+            for (var certificate : certs.chainCertificates(selected))
+              chain.add(
+                  Map.of(
+                      "index",
+                      index++,
+                      "certificateBase64",
+                      Base64.getEncoder().encodeToString(certificate.getEncoded())));
+            c.put(
+                "resolvedBody",
+                json.writeValueAsString(
+                    Map.of("id", external, "idType", idType, "certChain", chain)));
+          }
+        } else if (strict) throw new IllegalArgumentException("请选择客户");
+      }
+      if (selected != null) {
+        if (strict) {
+          certs.requireEnabled(selected);
+          require(available(selected), "所选证书链尚未生效或已过期");
+        }
+        c.put("resolvedAssetId", selected);
+        var nodes =
+            db.queryForList(
+                "select material_id from asset_chain_nodes where asset_id=? order by node_position",
+                Long.class,
+                selected);
+        Set<Long> requested = new HashSet<>();
+        if (kind.equals("IS_TRUSTSTORE") && mode.equals("MANUAL") && c.containsKey("materialIds")) {
+          require(c.get("materialIds") instanceof List<?>, "节点选择格式错误");
+          for (Object value : (List<?>) c.get("materialIds")) {
+            require(value instanceof Number, "节点标识错误");
+            requested.add(((Number) value).longValue());
+          }
+          require(!requested.isEmpty() && nodes.containsAll(requested), "至少选择一个属于当前链的节点");
+        }
+        var entries = new ArrayList<Map<String, Object>>();
+        for (long material : nodes) {
+          if (kind.equals("IS_TRUSTSTORE") && !requested.isEmpty() && !requested.contains(material))
+            continue;
+          var ref =
+              Map.<String, Object>of(
+                  "assetId",
+                  selected,
+                  "materialId",
+                  material,
+                  "alias",
+                  alias(material),
+                  "role",
+                  kind.equals("IS_KEYSTORE") ? "CHAIN" : "TRUST");
+          refs.add(ref);
+          entries.add(ref);
+        }
+        if (kind.equals("IS_KEYSTORE")) {
+          String keyAlias = str(c, "alias", "");
+          if (keyAlias.isBlank())
+            keyAlias = Objects.toString(certs.detail(selected).get("name"), "");
+          require(!keyAlias.isBlank(), "证书CN为空，请填写keystore别名");
+          var privateEntry = new LinkedHashMap<>(entries.getLast());
+          privateEntry.put("alias", keyAlias);
+          privateEntry.put("role", "PRIVATE");
+          entries.clear();
+          entries.add(privateEntry);
+        }
+        c.put("resolvedEntries", entries);
+      }
+      step.put("config", c);
     }
-    step.put("config", c);
   }
 
   /**
