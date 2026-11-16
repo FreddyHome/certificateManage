@@ -1,0 +1,19 @@
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.2.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.2.0 https://maven.apache.org/xsd/assembly-2.2.0.xsd">
+  <id>dist</id>
+  <formats><format>zip</format><format>dir</format></formats>
+  <includeBaseDirectory>true</includeBaseDirectory>
+  <baseDirectory>certificateManage</baseDirectory>
+  <files>
+    <file><source>${project.build.directory}/${project.build.finalName}.jar</source><outputDirectory>lib</outputDirectory><destName>certificate-manage.jar</destName></file>
+    <file><source>src/main/resources/application.yml</source><outputDirectory>config</outputDirectory></file>
+    <file><source>deploy/README.md</source><outputDirectory>/</outputDirectory></file>
+  </files>
+  <fileSets>
+    <fileSet><directory>deploy/config</directory><outputDirectory>config</outputDirectory></fileSet>
+    <fileSet><directory>deploy/bin</directory><outputDirectory>bin</outputDirectory><includes><include>*.bat</include></includes><lineEnding>dos</lineEnding></fileSet>
+    <fileSet><directory>deploy/bin</directory><outputDirectory>bin</outputDirectory><includes><include>*.sh</include></includes><lineEnding>unix</lineEnding><fileMode>0755</fileMode></fileSet>
+    <fileSet><directory>deploy/empty</directory><outputDirectory>logs</outputDirectory></fileSet>
+    <fileSet><directory>deploy/empty</directory><outputDirectory>data</outputDirectory></fileSet>
+    <fileSet><directory>deploy/empty</directory><outputDirectory>run</outputDirectory></fileSet>
+  </fileSets>
+</assembly>

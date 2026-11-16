@@ -22,3 +22,12 @@ app:
   encryption-key-file: ${ENCRYPTION_KEY_FILE:./data/master.key}
 
 spring.task.scheduling.pool.size: 4
+
+logging:
+  file:
+    name: ${LOG_FILE:./logs/certificate-manage.log}
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 30
+      total-size-cap: 1GB

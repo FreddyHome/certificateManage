@@ -1,0 +1,4 @@
+# One JVM argument per line, without surrounding quotes.
+-Xms128m
+-Xmx512m
+-Dfile.encoding=UTF-8

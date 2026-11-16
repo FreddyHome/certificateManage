@@ -464,3 +464,13 @@ V11新增 `sync_tasks.schedule_json CLOB`；V12扩展 `cron` 为 `VARCHAR(500)`�
 
 本轮验证包括同CN换证及快照冻结、基准软删除、五列交集及跨月日期、星期组合、旧规则兼容、时区/夏令时、权限与只读预览、V10起的迁移、过期响应隔离。最终后端116项、前端31项测试通过，已按项目约定重新打包重启并检查首页、API及实际页面；该结果不替代外部服务器业务联调。记录见 [五列计划实施记录](../docs/superpowers/plans/2026-11-16-calendar-schedule.md)。
 
+## 18. 标准部署包与维护脚本（2026-11-16）
+
+`production`构建在Spring Boot重打包之后执行Maven Assembly，生成`certificate-manage-0.1.0-dist.zip`及展开目录，包内根目录为`certificateManage`。`lib/certificate-manage.jar`仍是包含前端和第三方依赖的可执行JAR；`config/application.yml`来自应用默认配置，`config/jvm.options`逐行保存JVM参数；`bin`提供Windows BAT与Linux SH入口；logs/data/run仅包含目录占位，不拷贝运行文件。
+
+BAT使用系统自带Windows PowerShell实现精确进程检查与后台启动，控制逻辑内嵌于`service.bat`，发布包不增加第三种维护入口。Linux采用Bash、curl、flock及/proc核对精确的`-jar`参数。两套脚本解析自身路径并固定工作目录为项目根目录，以外置config目录作为Spring Boot附加配置位置，保留PORT、数据库及主密钥等环境变量覆盖方式。
+
+维护锁避免同时执行相冲突的管理动作；启动检查重复进程及探测地址占用，记录PID并等待首页/CSRF API就绪；状态区分健康运行、停止与异常。停止必须核对PID的Java及JAR身份，PID缺失时按精确JAR路径找回。Linux发送TERM并等待，超时保留PID、不默认强杀；Windows采用系统进程终止，不宣称具有相同的优雅关闭语义。
+
+默认应用日志写`logs/certificate-manage.log`，由Spring Boot/Logback按10MB、30天、总量1GB滚动。启动控制台输出单独写logs；数据库审计存储保持不变。运行时只安装lib/config/bin及说明文件，升级先停机备份原data与主密钥，不以新包覆盖data、logs或未经合并的配置。验收使用含空格的临时解压目录、独立端口与独立测试数据库验证真实脚本生命周期，不使用生产数据库做发布包启动测试。详见 [部署维护说明](../deploy/README.md)。
+

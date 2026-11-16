@@ -2,16 +2,97 @@
 
 Spring Boot 3.5 / Java 21 + Vue 3 / TypeScript + H2。前端编译后嵌入 Spring Boot，生产环境只启动一个 JAR。
 
-## 启动
+## 源码打包
 
-构建环境：JDK 21、Node.js 22.12+、npm。首次 Maven Wrapper 运行需要联网下载依赖。
+### 1. 准备构建环境
+
+需要JDK 21（不只是JRE）、Node.js 22.12+及npm，并确保`java`、`node`、`npm`在PATH中可用；建议JAVA_HOME指向JDK 21。项目自带Maven Wrapper，无需另装Maven。首次构建需要访问Maven依赖仓库及npm registry下载依赖。
+
+所有构建命令均在源码根目录执行，即包含`pom.xml`、`mvnw.cmd`和`frontend`的目录。
+
+### 2. 执行完整生产构建
+
+Windows（PowerShell或CMD）：
 
 ```powershell
-.\mvnw.cmd -Pproduction clean package
-java -jar target/certificate-manage-0.1.0.jar
+.\mvnw.cmd -Pproduction clean verify
 ```
 
-Linux/macOS 使用 `./mvnw -Pproduction clean package`。生成的 JAR 部署时仅需 Java 21。
+Linux：
+
+```bash
+chmod +x mvnw
+./mvnw -Pproduction clean verify
+```
+
+必须启用`production`配置；普通构建不会自动完成前端构建和发布包组装。无需先进入frontend手工执行npm，Maven会统一调用。构建依赖下载或任一测试/检查失败时，先处理失败原因，再重新构建；以命令退出成功及`BUILD SUCCESS`作为交付条件。
+
+### 3. 自动执行的打包流程
+
+| 顺序 | 阶段 | 执行内容 |
+| --- | --- | --- |
+| 1 | clean | 清理target中的上次构建产物，不清理项目根目录的data和logs |
+| 2 | generate-resources | 在frontend执行npm ci，再执行npm run build（TypeScript检查和Vite生产构建） |
+| 3 | process-resources / compile | 将前端dist复制到后端static资源目录，复制后端资源并编译Java |
+| 4 | test | 运行后端测试；执行前端npm run verify，包含格式检查、单元测试和类型检查 |
+| 5 | package | 生成JAR，Spring Boot重打包，将前端与第三方依赖内置到可执行JAR |
+| 6 | package | Maven Assembly按照deploy/assembly.xml组装发布目录及ZIP，自动放入配置、BAT和SH脚本 |
+| 7 | verify | 运行配置范围内的Java格式检查；全部检查成功后完成构建 |
+
+发布文件在package阶段已生成，但verify仍可能失败，因此不要仅凭ZIP存在判断构建通过。
+
+### 4. 获取构建产物
+
+当前版本为0.1.0，成功构建后生成：
+
+| 路径 | 用途 |
+| --- | --- |
+| `target/certificate-manage-0.1.0.jar` | Spring Boot可执行JAR，包含前端及第三方依赖 |
+| `target/certificate-manage-0.1.0-dist.zip` | 用于交付、上传和解压部署的完整发布包 |
+| `target/certificate-manage-0.1.0-dist/certificateManage/` | 与ZIP内容一致的展开目录，可直接检查目录结构和文件 |
+
+### 5. 发布包文件来源
+
+| 源码/构建文件 | 发布包内位置 | 打包处理 |
+| --- | --- | --- |
+| `target/certificate-manage-0.1.0.jar` | `lib/certificate-manage.jar` | 复制并使用固定运行文件名 |
+| `src/main/resources/application.yml` | `config/application.yml` | 复制默认应用配置，部署后可在JAR外修改 |
+| `deploy/config/jvm.options` | `config/jvm.options` | 复制JVM参数，每行一项 |
+| `deploy/bin/*.bat` | `bin/*.bat` | 自动复制Windows启动、停止、重启、状态及共用脚本，使用CRLF换行 |
+| `deploy/bin/*.sh` | `bin/*.sh` | 自动复制Linux对应脚本，使用LF换行并设置0755可执行权限 |
+| `deploy/README.md` | `README.md` | 发布包中的部署维护说明 |
+
+bin内脚本会在源码打包时一并放入展开目录和ZIP，部署人员无需手工创建或复制。维护脚本源码应修改deploy/bin，不修改target中的临时产物。发布包只带logs、data、run的目录占位，不包含已有数据库、主密钥、历史日志、测试脚本或前端node_modules。
+
+## 部署包结构与启动
+
+```text
+certificateManage/
+├── lib/certificate-manage.jar
+├── config/application.yml
+├── config/jvm.options
+├── bin/                  # start/stop/restart/status 的 .bat 和 .sh
+├── logs/                 # 默认系统日志、启动输出
+├── data/                 # 首次启动生成，升级时保留
+├── run/                  # PID与维护锁
+└── README.md
+```
+
+Windows使用`bin\start.bat`、`stop.bat`、`restart.bat`、`status.bat`；Linux使用对应`.sh`。脚本从任意目录调用，始终以项目根目录运行。Java依赖仍内置于单个可执行JAR中，lib不拆分第三方依赖。配置、日志和数据位于JAR外，发布包不包含已有数据库、主密钥或历史日志。详见[部署维护说明](deploy/README.md)。
+
+将ZIP解压到部署父目录后启动：
+
+```powershell
+# Windows
+.\certificateManage\bin\start.bat
+```
+
+```bash
+# Linux；解压工具若未保留权限，先执行 chmod +x certificateManage/bin/*.sh
+./certificateManage/bin/start.sh
+```
+
+部署运行只需Java 21，无需Node、npm或Maven。Linux维护脚本另需Bash 4.4+、curl及flock，Windows BAT使用系统自带PowerShell。升级时先停止原实例并备份data及主密钥，再更新lib、bin并合并config，保留已有data和logs。
 
 访问 http://127.0.0.1:8080 ，初始账号 `admin`，密码 `123456`。首次登录后在右上角修改密码。初始化仅执行一次，重启不会覆盖已保存密码。
 
@@ -30,6 +111,8 @@ Linux/macOS 使用 `./mvnw -Pproduction clean package`。生成的 JAR 部署时
 ## 数据与部署
 
 默认在**进程工作目录**生成 `data/certificate-manage.mv.db` 和 `data/master.key`。应固定工作目录并使用专用系统账号运行，限制这两个文件及其备份的访问权限。停机后同时备份整个 `data` 目录；恢复时必须使用同一份主密钥，丢失密钥无法解密已有私钥和SMTP密码。
+
+维护脚本加载`config/application.yml`覆盖内置默认配置，JVM参数按`config/jvm.options`每行一项读取。默认系统日志为`logs/certificate-manage.log`，10MB滚动、保留30天、总量1GB；可通过外置配置调整，或用`LOG_FILE`指定文件。启动输出另存`logs/console.log`与`console-error.log`。如直接改配置文件的端口/地址，应同时设置脚本的`HEALTH_URL`为可访问的本机根地址；使用`PORT`环境变量时两者会保持一致。
 
 支持以下环境变量：
 
