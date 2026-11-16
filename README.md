@@ -134,6 +134,22 @@ Windows使用`bin\start.bat`、`stop.bat`、`restart.bat`、`status.bat`；Linux
 
 ## 配置证书同步
 
+### 对接端三个API
+
+目标Integration Server需部署[WmCertificateManage对接包](integrations/WmCertificateManage.zip)。以下为目标IS接口，不是本系统的`/api/v1`接口：
+
+| 方法 | 路径 | 用途 | 主要参数 |
+| --- | --- | --- | --- |
+| GET | `/restv2/wm.certificate:cert/keystore/get` | 读取原证书库文件并返回Base64 | Query：`path` |
+| POST | `/restv2/wm.certificate:cert/keystore/update` | 备份原文件、写入证书库并刷新IS配置 | JSON：`keyStoreName`、`type`（key/trust）、`path`、`content` |
+| POST | `/restv2/wm.certificate:cert/tn/update` | 更新TN业务组件已有用途的证书链 | JSON：`id`、`idType`、`certChain[{index,certificateBase64}]` |
+
+调用使用目标IS账号及服务权限；请求/响应为JSON，读取接口通过Query传参。业务组件以HTTP 2xx且`code=0`判断成功；失败响应的`message`用于诊断，不能只检查HTTP状态。读取返回`path`及`content`，其中`content`是整个文件的Base64；TN节点是单张DER证书的Base64，两者不能混用。
+
+完整字段、请求/响应、curl示例、备份行为及TN已有记录限制见 [对接程序README](integrations/README.md)。
+
+### 业务组件配置
+
 新增任务提供三个业务组件及独立 Shell 步骤。业务组件为：IS truststore 更新（读取 SFTP/HTTP 原库 → 清理过期证书并导入指定节点 → HTTP 写入重载）、IS keyStore 更新（选择自有终端证书与完整链创建 JKS/PKCS12 → HTTP 写入重载，文件全路径在写入阶段配置）、TN 证书更新（客户与用途选择整链 → HTTP 更新）。默认自动选择到期最晚的可用客户链，每次入队时冻结；也可指定链，truststore 支持勾选节点。服务器鉴权复用服务器管理，IS 更新固定传入 `type=key/trust`，业务成功条件为 HTTP 2xx 且 `code=0`。新业务组件的列表保留摘要，原始HTTP请求响应可在加密审计详情中查看。Shell 配置见下文。旧通用任务仍兼容，以下通用步骤说明适用于已有任务。
 
 1. 在“服务器管理”新增SFTP或HTTP服务器，填写认证信息并保存测试。SFTP按用户确认的自管服务器场景不校验主机指纹，可选密码或SSH密钥认证；超时单位为秒。HTTP测试仅支持HEAD/GET，不上传证书。
