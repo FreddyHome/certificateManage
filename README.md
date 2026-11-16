@@ -2,6 +2,8 @@
 
 Spring Boot 3.5 / Java 21 + Vue 3 / TypeScript + H2。前端编译后嵌入 Spring Boot，生产环境只启动一个 JAR。
 
+使用人员请参阅[操作说明](doc/operation-manual.md)，包含证书管理、服务器配置、同步任务、执行计划、邮件提醒及日常维护。
+
 ## 源码打包
 
 ### 1. 准备构建环境
